@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [
-    { name = "vibespatial Contributors" },
+    { name = "Ben Jarmak", email = "ben@vibespatial.dev" },
 ]
 keywords = ["raster", "gpu", "cuda", "gis", "geospatial", "cupy", "nvrtc", "geotiff"]
 classifiers = [
@@ -36,10 +36,10 @@ gpu-io = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/picard/vibespatial-raster"
-Repository = "https://github.com/picard/vibespatial-raster"
-Documentation = "https://picard.github.io/vibespatial-raster/"
-Issues = "https://github.com/picard/vibespatial-raster/issues"
+Homepage = "https://github.com/jarmak-personal/vibespatial-raster"
+Repository = "https://github.com/jarmak-personal/vibespatial-raster"
+Documentation = "https://jarmak-personal.github.io/vibespatial-raster/"
+Issues = "https://github.com/jarmak-personal/vibespatial-raster/issues"
 
 [dependency-groups]
 dev = [
