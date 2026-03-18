@@ -82,6 +82,9 @@ __all__ = [
     "polygonize_gpu",
     "polygonize_to_gdf",
     "plan_polygonize_pipeline",
+    # NVRTC cache management (from vibespatial.cuda_runtime)
+    "clear_nvrtc_cache",
+    "nvrtc_cache_stats",
 ]
 
 
@@ -146,4 +149,13 @@ def __getattr__(name):
         from vibespatial.raster import polygonize
 
         return getattr(polygonize, name)
+    # NVRTC cache management
+    if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
+        from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats
+
+        _cache_api = {
+            "clear_nvrtc_cache": clear_nvrtc_cache,
+            "nvrtc_cache_stats": nvrtc_cache_stats,
+        }
+        return _cache_api[name]
     raise AttributeError(f"module 'vibespatial.raster' has no attribute {name!r}")
