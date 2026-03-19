@@ -87,10 +87,10 @@ def test_clear_populated_cache(tmp_path, monkeypatch):
     _get_cache_dir.cache_clear()
     try:
         for name in ("a", "b"):
-            (tmp_path / f"{name}.ptx").write_bytes(b"x" * 100)
+            (tmp_path / f"{name}.cubin").write_bytes(b"x" * 100)
         removed = clear_nvrtc_cache()
         assert removed == 2
-        assert len(list(tmp_path.glob("*.ptx"))) == 0
+        assert len(list(tmp_path.glob("*.cubin"))) == 0
     finally:
         _get_cache_dir.cache_clear()
 
@@ -100,7 +100,7 @@ def test_cache_stats_shape(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        (tmp_path / "kern.ptx").write_bytes(b"x" * 256)
+        (tmp_path / "kern.cubin").write_bytes(b"x" * 256)
         stats = nvrtc_cache_stats()
         assert stats["directory"] == str(tmp_path)
         assert stats["file_count"] == 1
@@ -118,11 +118,15 @@ def test_cache_stats_shape(tmp_path, monkeypatch):
 @needs_cache_api
 @pytest.mark.gpu
 def test_raster_kernel_compile_populates_disk_cache(tmp_path, monkeypatch):
-    """Compiling a raster NVRTC kernel writes PTX to the disk cache."""
+    """Compiling a raster NVRTC kernel writes a CUBIN to the disk cache."""
     from vibespatial.cuda_runtime import get_cuda_runtime, make_kernel_cache_key
 
-    runtime = get_cuda_runtime()
-    if runtime.compute_capability == (0, 0):
+    try:
+        runtime = get_cuda_runtime()
+        cc = runtime.compute_capability
+    except RuntimeError:
+        pytest.skip("CUDA runtime not available")
+    if cc == (0, 0):
         pytest.skip("CUDA runtime not available")
 
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
@@ -140,9 +144,9 @@ def test_raster_kernel_compile_populates_disk_cache(tmp_path, monkeypatch):
             source=_TRIVIAL_KERNEL,
             kernel_names=("test_raster_cache_kernel",),
         )
-        ptx_files = [p for p in tmp_path.glob("*.ptx") if "test_raster_cache" in p.name]
-        assert len(ptx_files) == 1
-        assert ptx_files[0].stat().st_size > 16
+        cubin_files = [p for p in tmp_path.glob("*.cubin") if "test_raster_cache" in p.name]
+        assert len(cubin_files) == 1
+        assert cubin_files[0].stat().st_size > 16
     finally:
         runtime._module_cache.pop(cache_key, None)
         _get_cache_dir.cache_clear()

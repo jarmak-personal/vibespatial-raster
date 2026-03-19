@@ -357,7 +357,36 @@ def polygonize_gpu(
     if data.ndim == 3:
         data = data[0]
 
-    height, width = data.shape
+    orig_height, orig_width = data.shape
+
+    if orig_height < 2 or orig_width < 2:
+        return [], []
+
+    # --- Pad the raster with a 1-pixel nodata border ---
+    # This is the standard marching-squares padding technique: by surrounding
+    # the raster with a border of "outside" values, boundary cells at the
+    # raster edge naturally become mixed cells and produce edges.  Without
+    # padding, homogeneous regions touching the raster border generate only
+    # class-15 (all-match) cells that emit zero edges, so rings can never
+    # close and no polygons are produced.
+    data_f64 = data.astype(np.float64)
+
+    # Choose a sentinel value for the padding border that is guaranteed to
+    # differ from every real data pixel.
+    if raster.nodata is not None and not np.isnan(raster.nodata):
+        pad_value = float(raster.nodata)
+    else:
+        # Use a value outside the data range (works even for NaN nodata)
+        finite_vals = data_f64[np.isfinite(data_f64)]
+        if finite_vals.size > 0:
+            pad_value = float(np.nanmin(finite_vals)) - 1.0
+        else:
+            pad_value = 0.0
+
+    padded = np.full((orig_height + 2, orig_width + 2), pad_value, dtype=np.float64)
+    padded[1:-1, 1:-1] = data_f64
+
+    height, width = padded.shape
     cell_width = width - 1
     cell_height = height - 1
     total_cells = cell_width * cell_height
@@ -365,19 +394,21 @@ def polygonize_gpu(
     if total_cells == 0:
         return [], []
 
-    # Transfer to device
-    d_raster = cp.asarray(np.ascontiguousarray(data.astype(np.float64)))
+    # Transfer padded raster to device
+    d_raster = cp.asarray(np.ascontiguousarray(padded))
 
-    # Nodata mask
-    d_nodata_mask = None
-    nodata_mask_ptr = 0
+    # Nodata mask for the padded raster: border pixels are always nodata,
+    # and interior pixels inherit the original nodata mask.
+    host_mask = np.ones((height, width), dtype=np.uint8)  # border = nodata
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            host_mask = np.isnan(data).astype(np.uint8)
+            host_mask[1:-1, 1:-1] = np.isnan(data).astype(np.uint8)
         else:
-            host_mask = (data == raster.nodata).astype(np.uint8)
-        d_nodata_mask = cp.asarray(host_mask)
-        nodata_mask_ptr = d_nodata_mask.data.ptr
+            host_mask[1:-1, 1:-1] = (data == raster.nodata).astype(np.uint8)
+    else:
+        host_mask[1:-1, 1:-1] = 0  # no nodata in original data
+    d_nodata_mask = cp.asarray(host_mask)
+    nodata_mask_ptr = d_nodata_mask.data.ptr
 
     # Allocate classification outputs
     d_cell_class = cp.zeros(total_cells, dtype=cp.int32)
@@ -438,47 +469,8 @@ def polygonize_gpu(
     n_nontrivial = int(compact_idx.size)
 
     if n_nontrivial == 0:
-        # All cells are trivial — the raster is homogeneous or all-nodata.
-        # Still need to produce polygons for homogeneous regions.
-        # Fall through to the ring assembly with no edges.
-        elapsed = time.perf_counter() - t0
-        raster.diagnostics.append(
-            RasterDiagnosticEvent(
-                kind=RasterDiagnosticKind.RUNTIME,
-                detail=f"gpu_polygonize classify_cells={total_cells} nontrivial=0 elapsed={elapsed:.3f}s",
-                residency=raster.residency,
-                visible_to_user=True,
-                elapsed_seconds=elapsed,
-            )
-        )
-        # For a homogeneous raster with no boundary cells, produce a single polygon
-        # covering the entire raster extent (if not all nodata).
-        unique_vals = np.unique(data)
-        if raster.nodata is not None:
-            if np.isnan(raster.nodata):
-                unique_vals = unique_vals[~np.isnan(unique_vals)]
-            else:
-                unique_vals = unique_vals[unique_vals != raster.nodata]
-        if len(unique_vals) == 0:
-            return [], []
-
-        a, b, c_aff, d_aff, e_aff, f_aff = raster.affine
-        geometries = []
-        values_out = []
-        for v in unique_vals:
-            # Build a polygon from the raster extent corners
-            corners = [
-                (c_aff, f_aff),  # TL: col=0, row=0
-                (a * width + c_aff, d_aff * width + f_aff),  # TR: col=width, row=0
-                (a * width + b * height + c_aff, d_aff * width + e_aff * height + f_aff),  # BR
-                (b * height + c_aff, e_aff * height + f_aff),  # BL: col=0, row=height
-                (c_aff, f_aff),  # close ring
-            ]
-            poly = Polygon(corners)
-            if not poly.is_empty and poly.is_valid:
-                geometries.append(poly)
-                values_out.append(float(v))
-        return geometries, values_out
+        # With padding, this only happens when the entire raster is nodata.
+        return [], []
 
     # --- Compute edge counts and prefix sum for write offsets ---
     d_edge_counts = cp.zeros(n_nontrivial, dtype=cp.int32)
@@ -518,7 +510,7 @@ def polygonize_gpu(
         d_edge_offsets[1:] = cumsum[:-1]
         d_edge_offsets[0] = 0
 
-    total_edges = int(cp.sum(d_edge_counts).get())
+    total_edges = int(cp.sum(d_edge_counts).item())
 
     if total_edges == 0:
         return [], []
@@ -540,6 +532,17 @@ def polygonize_gpu(
 
     a, b, c_aff, d_aff, e_aff, f_aff = raster.affine
 
+    # Adjust the affine translation to account for the 1-pixel padding.
+    # In the padded raster, pixel (col_p, row_p) corresponds to original
+    # pixel (col_p - 1, row_p - 1).  The kernel computes:
+    #   world_x = a * col_p + b * row_p + c_pad
+    # We need this to equal the original:
+    #   world_x = a * (col_p - 1) + b * (row_p - 1) + c_aff
+    #           = a * col_p + b * row_p + (c_aff - a - b)
+    # Same logic for the y components.
+    c_pad = c_aff - a - b
+    f_pad = f_aff - d_aff - e_aff
+
     emit_grid = (n_nontrivial + block_size - 1) // block_size
     emit_params = (
         (
@@ -556,10 +559,10 @@ def polygonize_gpu(
             n_nontrivial,
             a,
             b,
-            c_aff,
+            c_pad,
             d_aff,
             e_aff,
-            f_aff,
+            f_pad,
         ),
         (
             KERNEL_PARAM_PTR,  # compact_cell_idx

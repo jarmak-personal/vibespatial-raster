@@ -252,6 +252,14 @@ def nvimgcodec_read(
             )
             decode_kwargs["region"] = region
 
+        # ---- Decode params: preserve native dtype and band count ----
+        color_spec = (
+            nvimgcodec.ColorSpec.GRAY if cs.num_channels == 1 else nvimgcodec.ColorSpec.SRGB
+        )
+        decode_kwargs["params"] = nvimgcodec.DecodeParams(
+            allow_any_depth=True, color_spec=color_spec
+        )
+
         # ---- Decode to device ----
         nv_img = decoder.decode(cs, **decode_kwargs)
 

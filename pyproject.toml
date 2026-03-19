@@ -7,7 +7,7 @@ name = "vibespatial-raster"
 version = "0.1.5"
 description = "GPU-first raster processing for vibespatial"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 license = "Apache-2.0"
 authors = [
     { name = "Ben Jarmak", email = "ben@vibespatial.dev" },
@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: GIS",
 ]
 dependencies = [
-  "vibespatial>=0.1.0",
+  "vibespatial>=0.1.4",
   "scipy>=1.14",
 ]
 

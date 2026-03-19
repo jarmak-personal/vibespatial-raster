@@ -273,10 +273,10 @@ def label_gpu(
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_PTR),
                 ),
             )
-            if int(d_pj_changed.get()) == 0:
+            if int(d_pj_changed.item()) == 0:
                 break
 
-        if int(d_changed.get()) == 0:
+        if int(d_changed.item()) == 0:
             break
 
     iterations_done = _iteration + 1
