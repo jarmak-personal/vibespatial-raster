@@ -64,6 +64,13 @@ __all__ = [
     "raster_gaussian_filter",
     "raster_slope",
     "raster_aspect",
+    # Focal statistics
+    "raster_focal_min",
+    "raster_focal_max",
+    "raster_focal_mean",
+    "raster_focal_std",
+    "raster_focal_range",
+    "raster_focal_variety",
     # Zonal
     "zonal_stats",
     "zonal_stats_gdf",
@@ -114,6 +121,12 @@ def __getattr__(name):
         "raster_gaussian_filter",
         "raster_slope",
         "raster_aspect",
+        "raster_focal_min",
+        "raster_focal_max",
+        "raster_focal_mean",
+        "raster_focal_std",
+        "raster_focal_range",
+        "raster_focal_variety",
     ):
         from vibespatial.raster import algebra
 

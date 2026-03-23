@@ -8,6 +8,8 @@ ADR-0039: GPU Raster Algebra Dispatch
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from vibespatial.raster.buffers import (
@@ -489,3 +491,495 @@ def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
         affine=dem.affine,
         crs=dem.crs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Focal statistics (min, max, mean, std, range, variety)
+# ---------------------------------------------------------------------------
+
+
+def _has_cupy() -> bool:
+    """Return True if CuPy is importable."""
+    try:
+        import cupy  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 100_000) -> bool:
+    """Auto-dispatch heuristic: use GPU when available and image is large enough."""
+    try:
+        import cupy  # noqa: F401
+
+        from vibespatial.cuda_runtime import get_cuda_runtime
+
+        runtime = get_cuda_runtime()
+        return runtime.available() and raster.pixel_count >= threshold
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _parse_radius(radius) -> tuple[int, int]:
+    """Normalize radius argument to (radius_y, radius_x).
+
+    Parameters
+    ----------
+    radius : int or tuple[int, int]
+        If int, symmetric radius. If tuple, (radius_y, radius_x).
+    """
+    if isinstance(radius, (list, tuple)):
+        if len(radius) != 2:
+            raise ValueError(f"radius tuple must have 2 elements, got {len(radius)}")
+        return int(radius[0]), int(radius[1])
+    r = int(radius)
+    return r, r
+
+
+# -- CPU fallback implementations --
+
+
+def _focal_min_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal min via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = np.inf
+
+    def _fn(values):
+        valid = values[values != np.inf]
+        if len(valid) == 0:
+            return nodata_val if nodata_val is not None else np.nan
+        return valid.min()
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=np.inf)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+def _focal_max_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal max via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = -np.inf
+
+    def _fn(values):
+        valid = values[values != -np.inf]
+        if len(valid) == 0:
+            return nodata_val if nodata_val is not None else np.nan
+        return valid.max()
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=-np.inf)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+def _focal_mean_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal mean via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = np.nan
+
+    def _fn(values):
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return nodata_val if nodata_val is not None else np.nan
+        return valid.mean()
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=np.nan)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+def _focal_std_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal std (sample std, ddof=1) via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = np.nan
+
+    def _fn(values):
+        valid = values[~np.isnan(values)]
+        if len(valid) <= 1:
+            return 0.0
+        return valid.std(ddof=1)
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=np.nan)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+def _focal_range_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal range via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = np.nan
+
+    def _fn(values):
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return nodata_val if nodata_val is not None else np.nan
+        return valid.max() - valid.min()
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=np.nan)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+def _focal_variety_cpu(data: np.ndarray, radius_y: int, radius_x: int, nodata_mask, nodata_val):
+    """CPU focal variety (count unique) via scipy generic_filter."""
+    from scipy.ndimage import generic_filter
+
+    size = (2 * radius_y + 1, 2 * radius_x + 1)
+    work = data.astype(np.float64, copy=True)
+    if nodata_mask is not None:
+        work[nodata_mask] = np.nan
+
+    def _fn(values):
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return 0.0
+        return float(len(np.unique(valid)))
+
+    result = generic_filter(work, _fn, size=size, mode="constant", cval=np.nan)
+    if nodata_mask is not None and nodata_val is not None:
+        result[nodata_mask] = nodata_val
+    return result
+
+
+_CPU_DISPATCH = {
+    "min": _focal_min_cpu,
+    "max": _focal_max_cpu,
+    "mean": _focal_mean_cpu,
+    "std": _focal_std_cpu,
+    "range": _focal_range_cpu,
+    "variety": _focal_variety_cpu,
+}
+
+
+def _focal_stat_cpu(
+    raster: OwnedRasterArray, stat_name: str, radius_y: int, radius_x: int
+) -> OwnedRasterArray:
+    """CPU fallback for a single focal statistic."""
+    data = raster.to_numpy()
+    if data.ndim == 3:
+        data = data[0]
+
+    nodata_mask = raster.nodata_mask if raster.nodata is not None else None
+    nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
+
+    fn = _CPU_DISPATCH[stat_name]
+    t0 = time.monotonic()
+    result_data = fn(data, radius_y, radius_x, nodata_mask, nodata_val)
+    elapsed = time.monotonic() - t0
+
+    result = from_numpy(
+        result_data,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"cpu_focal_{stat_name} {raster.width}x{raster.height} "
+                f"radius=({radius_y},{radius_x})"
+            ),
+            residency=Residency.HOST,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
+
+
+# -- GPU implementation --
+
+# Maps stat name -> kernel int flag
+_STAT_NAME_TO_FLAG = {
+    "min": 0,
+    "max": 1,
+    "mean": 2,
+    "std": 3,
+    "range": 4,
+    "variety": 5,
+}
+
+
+def _focal_stat_gpu(
+    raster: OwnedRasterArray, stat_name: str, radius_y: int, radius_x: int
+) -> OwnedRasterArray:
+    """GPU implementation of focal statistics via NVRTC kernel."""
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_F64,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.focal import FOCAL_STATS_KERNEL_SOURCE
+
+    t0 = time.monotonic()
+
+    # Move to device, cast to float64 for kernel computation
+    d_data = _to_device_data(raster).astype(cp.float64)
+    if d_data.ndim == 3:
+        d_data = d_data[0]
+
+    height, width = d_data.shape
+
+    d_output = cp.zeros_like(d_data)
+
+    nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
+
+    if raster.nodata is not None:
+        d_nodata = raster.device_nodata_mask().astype(cp.uint8)
+        nodata_ptr = d_nodata.data.ptr
+    else:
+        nodata_ptr = 0  # nullptr
+
+    stat_flag = _STAT_NAME_TO_FLAG[stat_name]
+
+    runtime = get_cuda_runtime()
+    cache_key = make_kernel_cache_key("focal_stats", FOCAL_STATS_KERNEL_SOURCE)
+    kernels = runtime.compile_kernels(
+        cache_key=cache_key,
+        source=FOCAL_STATS_KERNEL_SOURCE,
+        kernel_names=("focal_stats",),
+    )
+
+    kernel = kernels["focal_stats"]
+
+    # Use 2D block layout for stencil kernel
+    block = (16, 16, 1)
+    grid = ((width + 15) // 16, (height + 15) // 16, 1)
+
+    params = (
+        (
+            d_data.data.ptr,
+            d_output.data.ptr,
+            nodata_ptr,
+            width,
+            height,
+            radius_x,
+            radius_y,
+            stat_flag,
+            nodata_val,
+        ),
+        (
+            KERNEL_PARAM_PTR,  # input
+            KERNEL_PARAM_PTR,  # output
+            KERNEL_PARAM_PTR,  # nodata_mask
+            KERNEL_PARAM_I32,  # width
+            KERNEL_PARAM_I32,  # height
+            KERNEL_PARAM_I32,  # radius_x
+            KERNEL_PARAM_I32,  # radius_y
+            KERNEL_PARAM_I32,  # stat_type
+            KERNEL_PARAM_F64,  # nodata_val
+        ),
+    )
+
+    runtime.launch(kernel=kernel, grid=grid, block=block, params=params)
+
+    host_result = cp.asnumpy(d_output)
+    elapsed = time.monotonic() - t0
+
+    result = from_numpy(
+        host_result,
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"gpu_focal_{stat_name} {width}x{height} "
+                f"radius=({radius_y},{radius_x}) blocks={grid}"
+            ),
+            residency=Residency.HOST,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
+
+
+# -- Public API --
+
+
+def raster_focal_min(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) minimum.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+        Window size = 2*radius + 1 in each dimension.
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "min", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "min", radius_y, radius_x)
+
+
+def raster_focal_max(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) maximum.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "max", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "max", radius_y, radius_x)
+
+
+def raster_focal_mean(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) mean.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "mean", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "mean", radius_y, radius_x)
+
+
+def raster_focal_std(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) standard deviation (sample, ddof=1).
+
+    Uses Welford's online algorithm on GPU to avoid catastrophic cancellation.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "std", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "std", radius_y, radius_x)
+
+
+def raster_focal_range(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) range (max - min).
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "range", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "range", radius_y, radius_x)
+
+
+def raster_focal_variety(
+    raster: OwnedRasterArray,
+    radius: int | tuple[int, int] = 1,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute focal (neighborhood) variety (count of unique values).
+
+    Uses register-based unique counting on GPU. Practical for windows
+    up to ~7x7 (49 unique values max).
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster (single-band).
+    radius : int or tuple[int, int]
+        Window radius. If int, symmetric. If tuple, (radius_y, radius_x).
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-select (None).
+    """
+    radius_y, radius_x = _parse_radius(radius)
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(raster)
+    if use_gpu:
+        return _focal_stat_gpu(raster, "variety", radius_y, radius_x)
+    return _focal_stat_cpu(raster, "variety", radius_y, radius_x)
