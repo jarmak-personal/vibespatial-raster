@@ -41,8 +41,11 @@ tests/                   # 8 test files (~2,300 lines), one per module
 scripts/
 └── check_zero_copy.py   # Zero-copy compliance linter (ZCOPY001-003)
 docs/                    # Sphinx + MyST documentation (user/ and dev/ guides)
-.claude/commands/
-└── gpu-kernel.md        # Detailed GPU kernel development guide (slash command)
+.claude/
+├── settings.json        # Hook registrations (pre-land-gate, file-guard)
+├── hooks/               # Enforcement hooks (pre-land-gate.sh, file-guard.sh)
+├── agents/              # 5 review agents (cuda-engineer, gpu-code-reviewer, etc.)
+└── skills/              # 7 skills (gpu-kernel, commit, pre-land-review, etc.)
 ```
 
 ## Build & Dev Setup
@@ -157,7 +160,34 @@ All GPU operations log `RasterDiagnosticEvent` with kind, detail string, residen
 
 ## GPU Kernel Development
 
-For detailed kernel patterns (shared-memory tiling, stencil ops, CCL union-find, marching squares), GPU saturation techniques (occupancy, coalescing, fusion), and cooperative primitives (`cuda.coop`), see `.claude/commands/gpu-kernel.md`.
+For detailed kernel patterns (shared-memory tiling, stencil ops, CCL union-find, marching squares), GPU saturation techniques (occupancy, coalescing, fusion), and cooperative primitives (`cuda.coop`), use `/gpu-kernel`.
+
+### Available Skills (Slash Commands)
+
+| Skill | Purpose |
+|-------|---------|
+| `/gpu-kernel` | GPU kernel development guide (NVRTC lifecycle, CCCL, stencils, CCL, dispatch) |
+| `/cuda-optimizer` | Read existing GPU code and produce concrete ranked optimization rewrites |
+| `/gpu-code-review` | Hardware-aware code review with quantitative thresholds and anti-patterns |
+| `/new-kernel-checklist` | Step-by-step checklist for adding a new GPU-dispatched operation |
+| `/raster-domain` | Domain knowledge oracle (nodata, affine, CCL, morphology, zonal, etc.) |
+| `/commit` | Full landing flow: pre-land review + staging + commit |
+| `/pre-land-review` | Review gate: deterministic checks + AI-powered agent reviews |
+
+### Review Agents (spawned by /pre-land-review)
+
+| Agent | Role |
+|-------|------|
+| `cuda-engineer` | Distinguished CUDA engineer for writing/optimizing GPU kernels |
+| `gpu-code-reviewer` | 6-pass GPU code review with fresh eyes |
+| `zero-copy-reviewer` | Device residency and zero-copy compliance enforcer |
+| `performance-reviewer` | Performance analysis and regression detection |
+| `maintainability-reviewer` | Exports, docs, tests, cross-reference integrity |
+
+### Enforcement Hooks
+
+- `.claude/hooks/pre-land-gate.sh` — blocks `--no-verify`, `core.hooksPath` changes, destructive ops on enforcement files
+- `.claude/hooks/file-guard.sh` — protects `.githooks/`, `.claude/hooks/`, `.claude/settings*.json`, and `/pre-land-review` from AI modification
 
 ## Common Pitfalls
 
