@@ -8,6 +8,7 @@ build/
 .pytest_cache/
 .ruff_cache/
 docs/_build/
+docs/api/
 SAMPLE_DATA/
 scripts/bench_output/
 .claude/worktrees/

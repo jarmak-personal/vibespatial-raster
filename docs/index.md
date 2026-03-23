@@ -70,4 +70,5 @@ stats = zonal_stats(zones, slope, ["mean", "max", "std"])
 
 user/index
 dev/index
+api/vibespatial/raster/index
 ```
