@@ -1626,6 +1626,18 @@ def _terrain_derivative_gpu(
         affine=dem.affine,
         crs=dem.crs,
     )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"gpu_terrain_{deriv_names.get(deriv_type, 'unknown')} "
+                f"{width}x{height} blocks={grid[0]}x{grid[1]}"
+            ),
+            residency=Residency.HOST,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
