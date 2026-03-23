@@ -65,6 +65,9 @@ __all__ = [
     "raster_slope",
     "raster_aspect",
     "raster_hillshade",
+    "raster_tri",
+    "raster_tpi",
+    "raster_curvature",
     # Zonal
     "zonal_stats",
     "zonal_stats_gdf",
@@ -119,6 +122,9 @@ def __getattr__(name):
         "raster_slope",
         "raster_aspect",
         "raster_hillshade",
+        "raster_tri",
+        "raster_tpi",
+        "raster_curvature",
     ):
         from vibespatial.raster import algebra
 
