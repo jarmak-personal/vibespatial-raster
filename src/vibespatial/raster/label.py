@@ -683,6 +683,7 @@ def sieve_filter(
     *,
     connectivity: int = 4,
     replace_value: int = 0,
+    use_gpu: bool | None = None,
 ) -> OwnedRasterArray:
     """Remove small connected components from a labeled raster.
 
@@ -696,12 +697,31 @@ def sieve_filter(
         4 or 8 neighbor connectivity (used for counting).
     replace_value : int
         Value to assign to removed components (default 0 = background).
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-dispatch (None).
+        Auto uses GPU when available and pixel count exceeds threshold.
 
     Returns
     -------
     OwnedRasterArray
         Sieved raster with small components replaced.
     """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(labeled)
+
+    if use_gpu:
+        return _sieve_gpu(labeled, min_size, replace_value=replace_value)
+    else:
+        return _sieve_cpu(labeled, min_size, replace_value=replace_value)
+
+
+def _sieve_cpu(
+    labeled: OwnedRasterArray,
+    min_size: int,
+    *,
+    replace_value: int = 0,
+) -> OwnedRasterArray:
+    """CPU sieve filter using numpy unique/bincount."""
     data = labeled.to_numpy().copy()
     if data.ndim == 3:
         data = data[0]
@@ -722,9 +742,146 @@ def sieve_filter(
     result.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"sieve_filter removed={removed_count} min_size={min_size}",
+            detail=f"sieve_filter_cpu removed={removed_count} min_size={min_size}",
             residency=result.residency,
         )
+    )
+    return result
+
+
+def _sieve_gpu(
+    labeled: OwnedRasterArray,
+    min_size: int,
+    *,
+    replace_value: int = 0,
+) -> OwnedRasterArray:
+    """GPU sieve filter -- entire pipeline stays on-device.
+
+    Uses CuPy bincount to count component sizes on-device, then an NVRTC
+    threshold kernel to zero out labels below min_size.  No D->H transfers
+    until the final result.
+    """
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.ccl import SIEVE_THRESHOLD_SOURCE
+
+    t0 = time.perf_counter()
+    runtime = get_cuda_runtime()
+
+    # --- Move labeled data to device ---
+    data = labeled.to_numpy()
+    if data.ndim == 3:
+        if data.shape[0] != 1:
+            raise ValueError("sieve_filter requires a single-band raster")
+        data = data[0]
+
+    height, width = data.shape
+    n = height * width
+
+    # H->D transfer (only transfer at start)
+    d_labels = cp.asarray(np.ascontiguousarray(data.ravel()).astype(np.int32))
+
+    # --- Count component sizes entirely on-device using CuPy bincount ---
+    # bincount requires non-negative values; labels should be >= 0 for
+    # foreground and 0 for background.  Negative labels (if any from raw CCL)
+    # are clamped to 0.
+    d_labels_nonneg = cp.maximum(d_labels, 0)
+    d_component_sizes = cp.bincount(d_labels_nonneg)
+    num_bins = int(d_component_sizes.shape[0])
+
+    # Ensure component_sizes is int32 for the kernel
+    d_component_sizes = d_component_sizes.astype(cp.int32)
+
+    # --- Allocate output on device ---
+    d_output = cp.empty(n, dtype=cp.int32)
+
+    # Determine nodata label (to preserve in output)
+    nodata = labeled.nodata
+    nodata_label = int(nodata) if nodata is not None else -1
+
+    # --- Compile and launch sieve threshold kernel ---
+    sieve_key = make_kernel_cache_key("sieve_threshold", SIEVE_THRESHOLD_SOURCE)
+    sieve_kernels = runtime.compile_kernels(
+        cache_key=sieve_key,
+        source=SIEVE_THRESHOLD_SOURCE,
+        kernel_names=("sieve_threshold",),
+    )
+
+    grid, block = runtime.launch_config(sieve_kernels["sieve_threshold"], n)
+
+    runtime.launch(
+        kernel=sieve_kernels["sieve_threshold"],
+        grid=grid,
+        block=block,
+        params=(
+            (
+                d_labels.data.ptr,
+                d_output.data.ptr,
+                d_component_sizes.data.ptr,
+                num_bins,
+                min_size,
+                replace_value,
+                nodata_label,
+                n,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+
+    # --- Count removed components on-device for diagnostics ---
+    # A component is removed if its size < min_size and it's not the nodata label.
+    # We count this on device to avoid extra D->H transfers.
+    d_sizes_below = d_component_sizes < min_size
+    # Don't count label 0 (background) or nodata label as "removed"
+    if num_bins > 0:
+        d_sizes_below[0] = False
+    if nodata_label > 0 and nodata_label < num_bins:
+        d_sizes_below[nodata_label] = False
+    removed_count = int(cp.sum(d_sizes_below).item())
+
+    # --- D->H transfer (final) ---
+    host_result = cp.asnumpy(d_output).reshape(height, width)
+
+    elapsed = time.perf_counter() - t0
+    result = from_numpy(
+        host_result.astype(np.int32),
+        nodata=nodata,
+        affine=labeled.affine,
+        crs=labeled.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"sieve_filter_gpu removed={removed_count} min_size={min_size} "
+                f"pixels={n} elapsed={elapsed:.3f}s"
+            ),
+            residency=result.residency,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
+        )
+    )
+    logger.debug(
+        "sieve_filter_gpu removed=%d min_size=%d pixels=%d elapsed=%.4fs",
+        removed_count,
+        min_size,
+        n,
+        elapsed,
     )
     return result
 

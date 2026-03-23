@@ -669,6 +669,135 @@ class TestMorphologyGPU:
 
 
 # ---------------------------------------------------------------------------
+# GPU tests: sieve filter
+# ---------------------------------------------------------------------------
+
+
+@requires_gpu
+class TestSieveFilterGPU:
+    """GPU sieve filter tests -- skipped when CuPy is not available."""
+
+    def test_gpu_removes_small_components(self):
+        """GPU sieve removes components below min_size."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=3, use_gpu=True)
+        sieved_data = sieved.to_numpy()
+        # Component with 4 pixels survives
+        assert sieved_data[0, 0] != 0
+        # Component with 1 pixel (the "2") is removed
+        assert sieved_data[0, 3] == 0
+
+    def test_gpu_matches_cpu(self):
+        """GPU sieve produces same result as CPU sieve."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 3],
+                [0, 0, 4, 4, 4],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        cpu_sieved = sieve_filter(labeled, min_size=3, use_gpu=False)
+        gpu_sieved = sieve_filter(labeled, min_size=3, use_gpu=True)
+        np.testing.assert_array_equal(cpu_sieved.to_numpy(), gpu_sieved.to_numpy())
+
+    def test_gpu_min_size_1_keeps_all(self):
+        """GPU sieve with min_size=1 keeps all components."""
+        data = np.array([[1, 0, 2]], dtype=np.int32)
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=1, use_gpu=True)
+        assert (sieved.to_numpy() > 0).sum() == 2
+
+    def test_gpu_all_removed(self):
+        """GPU sieve with large min_size removes all components."""
+        data = np.array(
+            [
+                [1, 0, 2],
+                [0, 3, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=100, use_gpu=True)
+        # All components are size 1, should all be removed
+        assert not sieved.to_numpy().any()
+
+    def test_gpu_preserves_background(self):
+        """GPU sieve does not modify background (0) pixels."""
+        data = np.array(
+            [
+                [0, 1, 0],
+                [0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=1, use_gpu=True)
+        sieved_data = sieved.to_numpy()
+        # Background stays 0
+        assert sieved_data[0, 0] == 0
+        assert sieved_data[1, 1] == 0
+        # Foreground pixel stays labeled
+        assert sieved_data[0, 1] != 0
+
+    def test_gpu_larger_raster_matches_cpu(self):
+        """GPU sieve matches CPU on a larger raster with many components."""
+        rng = np.random.RandomState(42)
+        data = rng.randint(0, 5, size=(30, 30)).astype(np.int32)
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        cpu_sieved = sieve_filter(labeled, min_size=5, use_gpu=False)
+        gpu_sieved = sieve_filter(labeled, min_size=5, use_gpu=True)
+        np.testing.assert_array_equal(cpu_sieved.to_numpy(), gpu_sieved.to_numpy())
+
+    def test_gpu_sieve_diagnostics(self):
+        """GPU sieve records diagnostic events."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        sieved = sieve_filter(labeled, min_size=3, use_gpu=True)
+        runtime_events = [
+            e for e in sieved.diagnostics if e.kind == "runtime" and "sieve_filter_gpu" in e.detail
+        ]
+        assert len(runtime_events) >= 1
+        assert runtime_events[0].elapsed_seconds > 0
+
+    def test_gpu_nodata_preserved(self):
+        """GPU sieve preserves nodata value correctly."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data, nodata=0)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        cpu_sieved = sieve_filter(labeled, min_size=3, use_gpu=False)
+        gpu_sieved = sieve_filter(labeled, min_size=3, use_gpu=True)
+        np.testing.assert_array_equal(cpu_sieved.to_numpy(), gpu_sieved.to_numpy())
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher tests (auto-dispatch, falls back to CPU gracefully)
 # ---------------------------------------------------------------------------
 
@@ -717,3 +846,33 @@ class TestDispatcher:
         raster = from_numpy(data)
         result = raster_morphology(raster, "erode", use_gpu=False)
         assert result is not None
+
+    def test_sieve_auto_dispatch(self):
+        """sieve_filter works with auto-dispatch."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        result = sieve_filter(labeled, min_size=3)
+        assert result is not None
+
+    def test_sieve_force_cpu(self):
+        """Forcing CPU works for sieve_filter."""
+        data = np.array(
+            [
+                [1, 1, 0, 2, 0],
+                [1, 1, 0, 0, 0],
+            ],
+            dtype=np.int32,
+        )
+        raster = from_numpy(data)
+        labeled = label_connected_components(raster, connectivity=4, use_gpu=False)
+        result = sieve_filter(labeled, min_size=3, use_gpu=False)
+        assert result is not None
+        assert result.to_numpy()[0, 0] != 0
+        assert result.to_numpy()[0, 3] == 0

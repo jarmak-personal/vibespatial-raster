@@ -276,3 +276,36 @@ void relabel(
     }
 }
 """
+
+# ---------------------------------------------------------------------------
+# Sieve filter: zero out labels with component size below threshold
+# ---------------------------------------------------------------------------
+
+SIEVE_THRESHOLD_SOURCE = r"""
+extern "C" __global__
+void sieve_threshold(
+    const int* __restrict__ labels_in,
+    int* __restrict__ labels_out,
+    const int* __restrict__ component_sizes,
+    const int num_bins,
+    const int min_size,
+    const int replace_value,
+    const int nodata_label,
+    const int n
+) {
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < n;
+         idx += stride) {
+        int label = labels_in[idx];
+        if (label == nodata_label) {
+            labels_out[idx] = replace_value;
+        } else if (label >= 0 && label < num_bins &&
+                   component_sizes[label] < min_size) {
+            labels_out[idx] = replace_value;
+        } else {
+            labels_out[idx] = label;
+        }
+    }
+}
+"""
