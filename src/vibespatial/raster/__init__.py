@@ -99,6 +99,8 @@ __all__ = [
     "polygonize_gpu",
     "polygonize_to_gdf",
     "plan_polygonize_pipeline",
+    # Resample
+    "raster_resample",
     # NVRTC cache management (from vibespatial.cuda_runtime)
     "clear_nvrtc_cache",
     "nvrtc_cache_stats",
@@ -185,6 +187,11 @@ def __getattr__(name):
         from vibespatial.raster import polygonize
 
         return getattr(polygonize, name)
+    # Resample
+    if name == "raster_resample":
+        from vibespatial.raster import resample
+
+        return getattr(resample, name)
     # NVRTC cache management
     if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
         from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats
