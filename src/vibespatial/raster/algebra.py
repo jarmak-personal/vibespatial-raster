@@ -432,12 +432,20 @@ def raster_slope(dem: OwnedRasterArray) -> OwnedRasterArray:
     if np.issubdtype(orig_dtype, np.floating) and orig_dtype != np.float64:
         host_result = host_result.astype(orig_dtype)
 
-    return from_numpy(
+    result = from_numpy(
         host_result,
         nodata=dem.nodata,
         affine=dem.affine,
         crs=dem.crs,
     )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"gpu_slope shape={dem.shape} dtype={dem.dtype}",
+            residency=Residency.HOST,
+        )
+    )
+    return result
 
 
 def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
@@ -489,3 +497,283 @@ def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
         affine=dem.affine,
         crs=dem.crs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Hillshade (fused Horn-method slope/aspect + illumination)
+# ---------------------------------------------------------------------------
+
+
+def _should_use_gpu(raster: OwnedRasterArray) -> bool:
+    """Auto-dispatch heuristic: use GPU if CuPy is available and raster is large enough."""
+    try:
+        import cupy as cp  # noqa: F401
+
+        from vibespatial.cuda_runtime import get_cuda_runtime
+
+        runtime = get_cuda_runtime()
+        return runtime.available() and raster.pixel_count >= 10_000
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _hillshade_cpu(
+    dem: OwnedRasterArray,
+    *,
+    azimuth: float = 315.0,
+    altitude: float = 45.0,
+    z_factor: float = 1.0,
+) -> OwnedRasterArray:
+    """CPU hillshade using Horn method (numpy)."""
+    data = dem.to_numpy().astype(np.float64)
+    if data.ndim == 3:
+        data = data[0]
+
+    height, width = data.shape
+
+    # Pixel size from affine transform
+    cell_x = abs(dem.affine[0]) if abs(dem.affine[0]) > 0 else 1.0
+    cell_y = abs(dem.affine[4]) if abs(dem.affine[4]) > 0 else 1.0
+
+    # Pad with edge replication for border handling
+    padded = np.pad(data, 1, mode="edge")
+
+    # Horn method partial derivatives
+    dz_dx = (
+        (
+            (padded[0:-2, 2:] + 2 * padded[1:-1, 2:] + padded[2:, 2:])
+            - (padded[0:-2, :-2] + 2 * padded[1:-1, :-2] + padded[2:, :-2])
+        )
+        / (8.0 * cell_x)
+        * z_factor
+    )
+
+    dz_dy = (
+        (
+            (padded[2:, 0:-2] + 2 * padded[2:, 1:-1] + padded[2:, 2:])
+            - (padded[0:-2, 0:-2] + 2 * padded[0:-2, 1:-1] + padded[0:-2, 2:])
+        )
+        / (8.0 * cell_y)
+        * z_factor
+    )
+
+    # Slope and aspect
+    slope = np.arctan(np.sqrt(dz_dx**2 + dz_dy**2))
+    aspect = np.arctan2(-dz_dy, dz_dx)
+
+    # Sun position in radians
+    zenith_rad = np.radians(90.0 - altitude)
+    azimuth_rad = np.radians(azimuth)
+
+    # Hillshade formula
+    hs = np.cos(zenith_rad) * np.cos(slope) + np.sin(zenith_rad) * np.sin(slope) * np.cos(
+        azimuth_rad - aspect
+    )
+
+    # Clamp and scale to uint8
+    hs = np.clip(hs, 0.0, 1.0)
+    result_data = (hs * 255.0 + 0.5).astype(np.uint8)
+
+    # Nodata propagation: any 3x3 neighbor touching nodata -> nodata output
+    nodata_out = 0
+    if dem.nodata is not None:
+        nd_mask = dem.nodata_mask
+        if nd_mask.ndim == 3:
+            nd_mask = nd_mask[0]
+        # Dilate nodata mask by 1 pixel (any neighbor nodata -> output nodata)
+        nd_padded = np.pad(nd_mask.astype(np.uint8), 1, mode="constant", constant_values=0)
+        nodata_expanded = np.zeros((height, width), dtype=bool)
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                nodata_expanded |= nd_padded[
+                    1 + dy : height + 1 + dy, 1 + dx : width + 1 + dx
+                ].astype(bool)
+        result_data[nodata_expanded] = nodata_out
+
+    return from_numpy(
+        result_data,
+        nodata=nodata_out if dem.nodata is not None else None,
+        affine=dem.affine,
+        crs=dem.crs,
+    )
+
+
+def _hillshade_gpu(
+    dem: OwnedRasterArray,
+    *,
+    azimuth: float = 315.0,
+    altitude: float = 45.0,
+    z_factor: float = 1.0,
+) -> OwnedRasterArray:
+    """GPU hillshade using NVRTC shared-memory 3x3 stencil kernel."""
+    import time as _time
+
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_F64,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.focal import HILLSHADE_KERNEL_SOURCE
+
+    # Move DEM to device
+    dem.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="hillshade requires device-resident data",
+    )
+
+    d_data = dem.device_data()
+    # Ensure fp64 for stencil precision (kernel expects double*)
+    if d_data.dtype != cp.float64:
+        d_data = d_data.astype(cp.float64)
+    if d_data.ndim == 3:
+        d_data = d_data[0]
+
+    height, width = d_data.shape
+
+    # Pixel size from affine
+    cell_x = abs(dem.affine[0]) if abs(dem.affine[0]) > 0 else 1.0
+    cell_y = abs(dem.affine[4]) if abs(dem.affine[4]) > 0 else 1.0
+
+    # Pre-convert angles to radians on host (avoids per-thread trig overhead)
+    zenith_rad = float(np.radians(90.0 - altitude))
+    azimuth_rad = float(np.radians(azimuth))
+
+    # Nodata mask (device-side, nullable)
+    nodata_out = np.uint8(0)
+    if dem.nodata is not None:
+        d_nodata = dem.device_nodata_mask()
+        if d_nodata.ndim == 3:
+            d_nodata = d_nodata[0]
+        d_nodata_u8 = d_nodata.astype(cp.uint8)
+        nodata_ptr = d_nodata_u8.data.ptr
+    else:
+        nodata_ptr = 0  # nullptr
+
+    # Allocate output on device
+    d_output = cp.zeros((height, width), dtype=cp.uint8)
+
+    # Compile kernel
+    runtime = get_cuda_runtime()
+    cache_key = make_kernel_cache_key("hillshade", HILLSHADE_KERNEL_SOURCE)
+    kernels = runtime.compile_kernels(
+        cache_key=cache_key,
+        source=HILLSHADE_KERNEL_SOURCE,
+        kernel_names=("hillshade",),
+    )
+
+    # 2D launch config: tile size must match kernel defines (TILE_W=16, TILE_H=16)
+    tile_w, tile_h = 16, 16
+    block = (tile_w, tile_h, 1)
+    grid = ((width + tile_w - 1) // tile_w, (height + tile_h - 1) // tile_h, 1)
+
+    params = (
+        (
+            d_data.data.ptr,
+            d_output.data.ptr,
+            nodata_ptr,
+            width,
+            height,
+            float(cell_x),
+            float(cell_y),
+            float(z_factor),
+            zenith_rad,
+            azimuth_rad,
+            int(nodata_out),
+        ),
+        (
+            KERNEL_PARAM_PTR,  # input
+            KERNEL_PARAM_PTR,  # output
+            KERNEL_PARAM_PTR,  # nodata_mask (nullable)
+            KERNEL_PARAM_I32,  # width
+            KERNEL_PARAM_I32,  # height
+            KERNEL_PARAM_F64,  # cell_x
+            KERNEL_PARAM_F64,  # cell_y
+            KERNEL_PARAM_F64,  # z_factor
+            KERNEL_PARAM_F64,  # zenith_rad
+            KERNEL_PARAM_F64,  # azimuth_rad
+            KERNEL_PARAM_I32,  # nodata_out (uint8 passed as int)
+        ),
+    )
+
+    # Shared memory: (TILE_H+2) * (TILE_W+2+1) * sizeof(double)
+    smem_bytes = (tile_h + 2) * (tile_w + 2 + 1) * 8
+
+    t0 = _time.perf_counter()
+    runtime.launch(
+        kernel=kernels["hillshade"],
+        grid=grid,
+        block=block,
+        params=params,
+        shared_mem_bytes=smem_bytes,
+    )
+
+    # D2H transfer (final result only -- zero-copy compliant)
+    host_result = cp.asnumpy(d_output)
+    elapsed = _time.perf_counter() - t0
+
+    result = from_numpy(
+        host_result,
+        nodata=int(nodata_out) if dem.nodata is not None else None,
+        affine=dem.affine,
+        crs=dem.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"gpu_hillshade {width}x{height} blocks={grid[0]}x{grid[1]} smem={smem_bytes}B"
+            ),
+            residency=Residency.HOST,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
+
+
+def raster_hillshade(
+    dem: OwnedRasterArray,
+    *,
+    azimuth: float = 315.0,
+    altitude: float = 45.0,
+    z_factor: float = 1.0,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute hillshade from a DEM raster.
+
+    Uses the Horn method to compute slope and aspect from a 3x3 neighborhood,
+    then applies the standard hillshade illumination formula.
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster (single-band).
+    azimuth : float
+        Direction of the light source in degrees (0=north, clockwise).
+        Default 315 (northwest).
+    altitude : float
+        Altitude of the light source in degrees above the horizon.
+        Default 45.
+    z_factor : float
+        Vertical exaggeration factor. Default 1.0.
+    use_gpu : bool or None
+        Force GPU (True) or CPU (False). None auto-detects.
+
+    Returns
+    -------
+    OwnedRasterArray
+        Hillshade raster with uint8 dtype (0-255). Nodata value is 0
+        when the input has nodata, otherwise None.
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu(dem)
+
+    if use_gpu:
+        return _hillshade_gpu(dem, azimuth=azimuth, altitude=altitude, z_factor=z_factor)
+    else:
+        return _hillshade_cpu(dem, azimuth=azimuth, altitude=altitude, z_factor=z_factor)
