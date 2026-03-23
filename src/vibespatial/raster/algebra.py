@@ -489,3 +489,333 @@ def raster_aspect(dem: OwnedRasterArray) -> OwnedRasterArray:
         affine=dem.affine,
         crs=dem.crs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Terrain derivatives: TRI, TPI, curvature
+# ---------------------------------------------------------------------------
+
+# Derivative type constants (must match DERIV_* in kernel source)
+_DERIV_TRI = 0
+_DERIV_TPI = 1
+_DERIV_CURV = 2
+
+
+def _has_cupy() -> bool:
+    """Return True if CuPy is importable."""
+    try:
+        import cupy  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _should_use_gpu_terrain(raster: OwnedRasterArray, threshold: int = 100_000) -> bool:
+    """Auto-dispatch heuristic: use GPU when available and image is large enough."""
+    try:
+        import cupy  # noqa: F401
+
+        from vibespatial.cuda_runtime import get_cuda_runtime
+
+        runtime = get_cuda_runtime()
+        return runtime.available() and raster.pixel_count >= threshold
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _terrain_derivative_gpu(
+    dem: OwnedRasterArray,
+    deriv_type: int,
+) -> OwnedRasterArray:
+    """Run terrain derivative kernel on GPU via NVRTC.
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster.
+    deriv_type : int
+        0=TRI, 1=TPI, 2=curvature.
+    """
+    import time
+
+    import cupy as cp
+
+    from vibespatial.cuda_runtime import (
+        KERNEL_PARAM_F64,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
+        make_kernel_cache_key,
+    )
+    from vibespatial.raster.kernels.focal import TERRAIN_DERIVATIVES_KERNEL_SOURCE
+
+    t0 = time.perf_counter()
+
+    # Move to device; work in float64 for accuracy
+    dem.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="terrain derivative requires device-resident data",
+    )
+    d_data = dem.device_data().astype(cp.float64)
+    if d_data.ndim == 3:
+        d_data = d_data[0]
+
+    height, width = d_data.shape
+
+    # Output buffer
+    d_output = cp.empty((height, width), dtype=cp.float64)
+
+    # Nodata
+    nodata_val = float(dem.nodata) if dem.nodata is not None else -9999.0
+    if dem.nodata is not None:
+        d_nodata = dem.device_nodata_mask().astype(cp.uint8)
+        nodata_ptr = d_nodata.data.ptr
+    else:
+        nodata_ptr = 0  # nullptr
+
+    # Cell sizes from affine
+    cellsize_x = abs(dem.affine[0])
+    cellsize_y = abs(dem.affine[4])
+    if cellsize_x == 0.0:
+        cellsize_x = 1.0
+    if cellsize_y == 0.0:
+        cellsize_y = 1.0
+
+    # Compile kernel
+    runtime = get_cuda_runtime()
+    cache_key = make_kernel_cache_key("terrain_derivatives", TERRAIN_DERIVATIVES_KERNEL_SOURCE)
+    kernels = runtime.compile_kernels(
+        cache_key=cache_key,
+        source=TERRAIN_DERIVATIVES_KERNEL_SOURCE,
+        kernel_names=("terrain_derivatives",),
+    )
+
+    # 2D launch config — tile size matches kernel's TILE_W/TILE_H (16x16)
+    block = (16, 16, 1)
+    grid = ((width + 15) // 16, (height + 15) // 16, 1)
+
+    params = (
+        (
+            d_data.data.ptr,
+            d_output.data.ptr,
+            nodata_ptr,
+            width,
+            height,
+            cellsize_x,
+            cellsize_y,
+            nodata_val,
+            deriv_type,
+        ),
+        (
+            KERNEL_PARAM_PTR,  # input
+            KERNEL_PARAM_PTR,  # output
+            KERNEL_PARAM_PTR,  # nodata_mask
+            KERNEL_PARAM_I32,  # width
+            KERNEL_PARAM_I32,  # height
+            KERNEL_PARAM_F64,  # cellsize_x
+            KERNEL_PARAM_F64,  # cellsize_y
+            KERNEL_PARAM_F64,  # nodata_val
+            KERNEL_PARAM_I32,  # deriv_type
+        ),
+    )
+
+    runtime.launch(
+        kernel=kernels["terrain_derivatives"],
+        grid=grid,
+        block=block,
+        params=params,
+    )
+
+    host_result = cp.asnumpy(d_output)
+    elapsed = time.perf_counter() - t0
+
+    deriv_names = {_DERIV_TRI: "TRI", _DERIV_TPI: "TPI", _DERIV_CURV: "curvature"}
+    result = from_numpy(
+        host_result,
+        nodata=dem.nodata,
+        affine=dem.affine,
+        crs=dem.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"gpu_terrain_{deriv_names.get(deriv_type, 'unknown')} "
+                f"{width}x{height} blocks={grid[0]}x{grid[1]}"
+            ),
+            residency=Residency.HOST,
+            visible_to_user=True,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result
+
+
+def _terrain_derivative_cpu(
+    dem: OwnedRasterArray,
+    deriv_type: int,
+) -> OwnedRasterArray:
+    """Compute terrain derivative on CPU using numpy 3x3 window operations.
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster.
+    deriv_type : int
+        0=TRI, 1=TPI, 2=curvature.
+    """
+    data = dem.to_numpy().astype(np.float64)
+    if data.ndim == 3:
+        data = data[0]
+
+    height, width = data.shape
+    nodata_val = float(dem.nodata) if dem.nodata is not None else -9999.0
+
+    # Pad with edge replication for boundary handling
+    padded = np.pad(data, 1, mode="edge")
+
+    # Extract 3x3 neighborhood elements (named per kernel convention)
+    z0 = padded[0:-2, 0:-2]  # top-left
+    z1 = padded[0:-2, 1:-1]  # top-center
+    z2 = padded[0:-2, 2:]  # top-right
+    z3 = padded[1:-1, 0:-2]  # mid-left
+    z4 = padded[1:-1, 1:-1]  # center
+    z5 = padded[1:-1, 2:]  # mid-right
+    z6 = padded[2:, 0:-2]  # bot-left
+    z7 = padded[2:, 1:-1]  # bot-center
+    z8 = padded[2:, 2:]  # bot-right
+
+    if deriv_type == _DERIV_TRI:
+        # TRI: mean absolute difference between center and 8 neighbors
+        result = (
+            np.abs(z0 - z4)
+            + np.abs(z1 - z4)
+            + np.abs(z2 - z4)
+            + np.abs(z3 - z4)
+            + np.abs(z5 - z4)
+            + np.abs(z6 - z4)
+            + np.abs(z7 - z4)
+            + np.abs(z8 - z4)
+        ) / 8.0
+    elif deriv_type == _DERIV_TPI:
+        # TPI: center minus mean of 8 neighbors
+        neighbor_mean = (z0 + z1 + z2 + z3 + z5 + z6 + z7 + z8) / 8.0
+        result = z4 - neighbor_mean
+    else:
+        # Profile curvature — Zevenbergen & Thorne (1987)
+        cellsize_x = abs(dem.affine[0])
+        cellsize_y = abs(dem.affine[4])
+        if cellsize_x == 0.0:
+            cellsize_x = 1.0
+        if cellsize_y == 0.0:
+            cellsize_y = 1.0
+
+        D = ((z3 + z5) / 2.0 - z4) / (cellsize_x * cellsize_x)
+        E = ((z1 + z7) / 2.0 - z4) / (cellsize_y * cellsize_y)
+        result = -2.0 * (D + E) * 100.0
+
+    # Border pixels -> nodata (GPU kernel also marks them as nodata)
+    output = np.full((height, width), nodata_val, dtype=np.float64)
+    output[1:-1, 1:-1] = result[1:-1, 1:-1]
+
+    # Nodata propagation: if center or any neighbor is nodata
+    if dem.nodata is not None:
+        nodata_mask = dem.nodata_mask
+        if nodata_mask.ndim == 3:
+            nodata_mask = nodata_mask[0]
+        # Dilate the nodata mask by 1 pixel (any neighbor nodata -> output nodata)
+        padded_mask = np.pad(nodata_mask, 1, mode="constant", constant_values=False)
+        any_nodata = np.zeros((height, width), dtype=bool)
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                any_nodata |= padded_mask[1 + dy : height + 1 + dy, 1 + dx : width + 1 + dx]
+        output[any_nodata] = nodata_val
+
+    return from_numpy(
+        output,
+        nodata=dem.nodata,
+        affine=dem.affine,
+        crs=dem.crs,
+    )
+
+
+def raster_tri(
+    dem: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute Terrain Ruggedness Index (TRI) from a DEM raster.
+
+    TRI is the mean absolute difference between the center cell and its
+    8 neighbors. Riley et al. (1999).
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster.
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-dispatch (None).
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_terrain(dem)
+
+    if use_gpu:
+        return _terrain_derivative_gpu(dem, _DERIV_TRI)
+    else:
+        return _terrain_derivative_cpu(dem, _DERIV_TRI)
+
+
+def raster_tpi(
+    dem: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute Topographic Position Index (TPI) from a DEM raster.
+
+    TPI is the center cell elevation minus the mean of its 8 neighbors.
+    Positive values indicate ridges/hilltops, negative values indicate
+    valleys.
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster.
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-dispatch (None).
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_terrain(dem)
+
+    if use_gpu:
+        return _terrain_derivative_gpu(dem, _DERIV_TPI)
+    else:
+        return _terrain_derivative_cpu(dem, _DERIV_TPI)
+
+
+def raster_curvature(
+    dem: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Compute profile curvature from a DEM raster.
+
+    Uses second-order finite differences from the 3x3 window per
+    Zevenbergen & Thorne (1987). Positive curvature indicates concave
+    surfaces, negative indicates convex.
+
+    Parameters
+    ----------
+    dem : OwnedRasterArray
+        Digital Elevation Model raster.
+    use_gpu : bool or None
+        Force GPU (True), CPU (False), or auto-dispatch (None).
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_terrain(dem)
+
+    if use_gpu:
+        return _terrain_derivative_gpu(dem, _DERIV_CURV)
+    else:
+        return _terrain_derivative_cpu(dem, _DERIV_CURV)
