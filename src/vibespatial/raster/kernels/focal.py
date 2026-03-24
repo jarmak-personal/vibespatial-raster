@@ -158,15 +158,16 @@ SLOPE_ASPECT_KERNEL_SOURCE = r"""
 #define TILE_W 16
 #define TILE_H 16
 
-/* Safe global memory fetch: returns 0.0 for out-of-bounds coordinates. */
+/* Safe global memory fetch: clamps coordinates to raster edge (edge replication).
+ * This matches the CPU path which uses np.pad(mode="edge"). */
 __device__ __forceinline__
 double safe_fetch_d(
     const double* __restrict__ data,
     int x, int y, int width, int height
 ) {
-    if (x >= 0 && x < width && y >= 0 && y < height)
-        return data[(long long)y * width + x];
-    return 0.0;
+    int cy = min(max(y, 0), height - 1);
+    int cx = min(max(x, 0), width - 1);
+    return data[(long long)cy * width + cx];
 }
 
 extern "C" __global__
@@ -510,66 +511,63 @@ extern "C" __global__ void terrain_derivatives(
     const int row = blockIdx.y * TILE_H + ty;
 
     // ------------------------------------------------------------------
-    // Load center of tile
+    // Load center of tile (clamp to raster bounds = edge replication)
     // ------------------------------------------------------------------
-    double center_val = 0.0;
-    if (col < width && row < height) {
-        center_val = input[(long long)row * width + col];
+    {
+        int cr = min(max(row, 0), height - 1);
+        int cc = min(max(col, 0), width - 1);
+        tile[ty + 1][tx + 1] = input[(long long)cr * width + cc];
     }
-    tile[ty + 1][tx + 1] = center_val;
 
     // ------------------------------------------------------------------
-    // Load halo cells (border threads load the extra ring)
+    // Load halo cells using clamped coordinates (edge replication,
+    // matches CPU np.pad(mode="edge") behaviour)
     // ------------------------------------------------------------------
     // Left halo
     if (tx == 0) {
-        int hcol = col - 1;
-        int hrow = row;
-        tile[ty + 1][0] = (hcol >= 0 && hrow >= 0 && hrow < height)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row, 0), height - 1);
+        int hc = min(max(col - 1, 0), width - 1);
+        tile[ty + 1][0] = input[(long long)hr * width + hc];
     }
     // Right halo
     if (tx == TILE_W - 1 || col == width - 1) {
-        int hcol = col + 1;
-        int hrow = row;
-        tile[ty + 1][tx + 2] = (hcol < width && hrow >= 0 && hrow < height)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row, 0), height - 1);
+        int hc = min(max(col + 1, 0), width - 1);
+        tile[ty + 1][tx + 2] = input[(long long)hr * width + hc];
     }
     // Top halo
     if (ty == 0) {
-        int hcol = col;
-        int hrow = row - 1;
-        tile[0][tx + 1] = (hrow >= 0 && hcol >= 0 && hcol < width)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row - 1, 0), height - 1);
+        int hc = min(max(col, 0), width - 1);
+        tile[0][tx + 1] = input[(long long)hr * width + hc];
     }
     // Bottom halo
     if (ty == TILE_H - 1 || row == height - 1) {
-        int hcol = col;
-        int hrow = row + 1;
-        tile[ty + 2][tx + 1] = (hrow < height && hcol >= 0 && hcol < width)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row + 1, 0), height - 1);
+        int hc = min(max(col, 0), width - 1);
+        tile[ty + 2][tx + 1] = input[(long long)hr * width + hc];
     }
     // Four corners
     if (tx == 0 && ty == 0) {
-        int hcol = col - 1; int hrow = row - 1;
-        tile[0][0] = (hcol >= 0 && hrow >= 0)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row - 1, 0), height - 1);
+        int hc = min(max(col - 1, 0), width - 1);
+        tile[0][0] = input[(long long)hr * width + hc];
     }
     if ((tx == TILE_W - 1 || col == width - 1) && ty == 0) {
-        int hcol = col + 1; int hrow = row - 1;
-        tile[0][tx + 2] = (hcol < width && hrow >= 0)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row - 1, 0), height - 1);
+        int hc = min(max(col + 1, 0), width - 1);
+        tile[0][tx + 2] = input[(long long)hr * width + hc];
     }
     if (tx == 0 && (ty == TILE_H - 1 || row == height - 1)) {
-        int hcol = col - 1; int hrow = row + 1;
-        tile[ty + 2][0] = (hcol >= 0 && hrow < height)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row + 1, 0), height - 1);
+        int hc = min(max(col - 1, 0), width - 1);
+        tile[ty + 2][0] = input[(long long)hr * width + hc];
     }
     if ((tx == TILE_W - 1 || col == width - 1) &&
         (ty == TILE_H - 1 || row == height - 1)) {
-        int hcol = col + 1; int hrow = row + 1;
-        tile[ty + 2][tx + 2] = (hcol < width && hrow < height)
-            ? input[(long long)hrow * width + hcol] : 0.0;
+        int hr = min(max(row + 1, 0), height - 1);
+        int hc = min(max(col + 1, 0), width - 1);
+        tile[ty + 2][tx + 2] = input[(long long)hr * width + hc];
     }
 
     __syncthreads();
