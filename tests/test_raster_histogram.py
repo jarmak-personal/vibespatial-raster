@@ -167,6 +167,132 @@ class TestRasterHistogramEqualizeCPU:
         result = raster_histogram_equalize(raster_float, use_gpu=False)
         assert result.affine == raster_float.affine
 
+    def test_nan_nodata_float64(self):
+        """Regression test for bug #7: NaN nodata corrupts min/max normalization.
+
+        When nodata=NaN, the old code used `data[data != nodata]` which includes
+        NaN values (IEEE 754: NaN != NaN is True). NaN then corrupts np.min/np.max,
+        producing NaN for dmin/dmax and garbage output.
+        """
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.array(
+            [[10.0, 20.0, 30.0], [40.0, np.nan, 60.0], [70.0, 80.0, 90.0]],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        result = raster_histogram_equalize(raster, use_gpu=False)
+
+        result_data = result.to_numpy()
+        assert result.dtype == np.uint8
+        assert result.shape == (3, 3)
+        # All valid pixels must be finite (no NaN leaking into uint8 output)
+        # NaN nodata pixel at [1, 1] maps to nodata_u8=0 in the equalized output
+        valid_positions = [(0, 0), (0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1), (2, 2)]
+        for r, c in valid_positions:
+            assert 0 <= result_data[r, c] <= 255, f"pixel [{r},{c}] out of range"
+        # Output should span a wide range (equalization spreads values)
+        valid_vals = np.array([result_data[r, c] for r, c in valid_positions])
+        assert valid_vals.max() > valid_vals.min(), "equalization should spread values"
+
+    def test_nan_nodata_float32(self):
+        """NaN nodata with float32 dtype."""
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.array(
+            [[1.0, 2.0, np.nan], [4.0, 5.0, 6.0], [np.nan, 8.0, 9.0]],
+            dtype=np.float32,
+        )
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        result = raster_histogram_equalize(raster, use_gpu=False)
+
+        result_data = result.to_numpy()
+        assert result.dtype == np.uint8
+        assert result.shape == (3, 3)
+        # 7 valid pixels, 2 NaN nodata -- valid pixels should all be in [0, 255]
+        nodata_mask = np.isnan(data)
+        assert np.all(result_data[~nodata_mask] <= 255)
+        assert np.all(result_data[~nodata_mask] >= 0)
+
+    def test_nan_nodata_all_nan(self):
+        """All-NaN raster with NaN nodata should produce all-zero output."""
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.full((3, 3), np.nan, dtype=np.float64)
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        result = raster_histogram_equalize(raster, use_gpu=False)
+
+        result_data = result.to_numpy()
+        assert result.dtype == np.uint8
+        # All pixels are nodata -> output should be all zeros
+        np.testing.assert_array_equal(result_data, 0)
+        # NaN nodata cannot be preserved in uint8 output, so out_nodata is None
+        assert result.nodata is None
+
+    def test_nan_nodata_preserves_metadata(self):
+        """Metadata (affine, crs, shape) preserved through NaN nodata equalization."""
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.array(
+            [[10.0, np.nan], [30.0, 40.0]],
+            dtype=np.float64,
+        )
+        affine = (2.0, 0.0, 100.0, 0.0, -2.0, 200.0)
+        raster = from_numpy(data, nodata=np.nan, affine=affine, crs="EPSG:4326")
+        result = raster_histogram_equalize(raster, use_gpu=False)
+
+        assert result.shape == raster.shape
+        assert result.affine == affine
+        assert result.crs == raster.crs
+
+    def test_nan_nodata_diagnostic_event(self):
+        """Equalization with NaN nodata should emit a diagnostic event."""
+        from vibespatial.raster.buffers import RasterDiagnosticKind
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        data = np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float64)
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0))
+        result = raster_histogram_equalize(raster, use_gpu=False)
+
+        runtime_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.RUNTIME]
+        assert len(runtime_events) >= 1
+        assert "raster_histogram_equalize" in runtime_events[0].detail
+        assert "cpu" in runtime_events[0].detail
+
+
+# ---------------------------------------------------------------------------
+# CPU tests — NaN nodata for histogram and percentile
+# ---------------------------------------------------------------------------
+
+
+class TestNaNNodataHistogramCPU:
+    """Verify that histogram and percentile correctly exclude NaN nodata pixels."""
+
+    def test_histogram_nan_nodata_excluded(self):
+        from vibespatial.raster.histogram import raster_histogram
+
+        data = np.array(
+            [[10.0, 20.0, 30.0], [40.0, np.nan, 60.0], [70.0, 80.0, 90.0]],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        counts, _edges = raster_histogram(raster, bins=10, use_gpu=False)
+        # 9 pixels total, 1 NaN nodata -> 8 valid
+        assert counts.sum() == 8
+
+    def test_percentile_nan_nodata_excluded(self):
+        from vibespatial.raster.histogram import raster_percentile
+
+        data = np.array(
+            [[10.0, 20.0, 30.0], [40.0, np.nan, 60.0], [70.0, 80.0, 90.0]],
+            dtype=np.float64,
+        )
+        raster = from_numpy(data, nodata=np.nan, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 3.0))
+        result = raster_percentile(raster, 50.0, bins=100, use_gpu=False)
+        assert not np.isnan(result[0]), "NaN nodata must not corrupt percentile result"
+        # Median of [10, 20, 30, 40, 60, 70, 80, 90] is ~50
+        assert 30.0 <= result[0] <= 70.0
+
 
 # ---------------------------------------------------------------------------
 # CPU tests — raster_percentile

@@ -37,7 +37,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/algebra.py:1834`
   - `nodata_mask` can be 3D while `data` is squeezed to 2D. Would cause shape mismatch crash.
 
-- [ ] **7. Histogram equalize CPU: NaN nodata not handled correctly**
+- [x] **7. Histogram equalize CPU: NaN nodata not handled correctly**
   - `src/vibespatial/raster/histogram.py:109-123`
   - `data[data != raster.nodata]` when `nodata=NaN` includes all NaN values (since `NaN != NaN` is True). NaN values corrupt the normalization range.
 

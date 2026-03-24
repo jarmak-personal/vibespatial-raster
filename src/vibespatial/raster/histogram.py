@@ -106,18 +106,18 @@ def _raster_histogram_equalize_cpu(
 
     # Work with uint8 for equalization
     if data.dtype != np.uint8:
-        dmin = (
-            float(np.nanmin(data))
-            if raster.nodata is None
-            else float(np.min(data[data != raster.nodata]) if np.any(data != raster.nodata) else 0)
-        )
-        dmax = (
-            float(np.nanmax(data))
-            if raster.nodata is None
-            else float(
-                np.max(data[data != raster.nodata]) if np.any(data != raster.nodata) else 255
-            )
-        )
+        if raster.nodata is None:
+            dmin = float(np.nanmin(data))
+            dmax = float(np.nanmax(data))
+        else:
+            # Use np.isnan() for NaN nodata — IEEE 754 means NaN != NaN is True,
+            # so `data[data != nodata]` would include NaN values and corrupt min/max.
+            if np.isnan(raster.nodata):
+                valid = data[~np.isnan(data)]
+            else:
+                valid = data[data != raster.nodata]
+            dmin = float(np.min(valid)) if valid.size > 0 else 0.0
+            dmax = float(np.max(valid)) if valid.size > 0 else 255.0
         if dmax <= dmin:
             dmax = dmin + 1.0
         normalized = np.clip((data.astype(np.float64) - dmin) / (dmax - dmin) * 255.0, 0, 255)
@@ -138,9 +138,14 @@ def _raster_histogram_equalize_cpu(
         valid = flat
 
     if valid.size == 0:
+        # Use the same out_nodata logic as the main return path:
+        # only preserve nodata for uint8 inputs (NaN cannot be represented in uint8).
+        early_nodata = (
+            int(raster.nodata) if raster.nodata is not None and data.dtype == np.uint8 else None
+        )
         return from_numpy(
             np.zeros(original_shape, dtype=np.uint8),
-            nodata=raster.nodata,
+            nodata=early_nodata,
             affine=raster.affine,
             crs=raster.crs,
         )
