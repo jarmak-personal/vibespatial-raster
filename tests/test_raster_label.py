@@ -667,6 +667,66 @@ class TestMorphologyGPU:
         assert len(runtime_events) == 1
         assert runtime_events[0].elapsed_seconds > 0
 
+    def test_gpu_morphology_no_dh_d_ping_pong(self):
+        """morphology_gpu must not D->H->D ping-pong on device-resident input.
+
+        Regression test for BUG_SWEEP #15: the legacy path used
+        raster.to_numpy() + cp.asarray() instead of the device residency API,
+        causing an unnecessary device->host->device transfer.
+        """
+        from vibespatial.raster.label import morphology_gpu
+        from vibespatial.residency import Residency
+
+        data = np.zeros((10, 10), dtype=np.uint8)
+        data[3:7, 3:7] = 1
+        # Create raster already on device
+        raster = from_numpy(data, residency=Residency.DEVICE)
+
+        # Snapshot diagnostics length after initial H->D transfer
+        diag_baseline = len(raster.diagnostics)
+
+        result = morphology_gpu(raster, "erode", connectivity=4)
+
+        # The input raster must NOT have gained any device->host transfer
+        # events during the morphology_gpu call.
+        new_events = raster.diagnostics[diag_baseline:]
+        d2h_events = [e for e in new_events if e.kind == "transfer" and "device->host" in e.detail]
+        assert len(d2h_events) == 0, (
+            f"morphology_gpu triggered {len(d2h_events)} device->host "
+            f"transfer(s) on a device-resident input: {d2h_events}"
+        )
+
+        # Result should still be correct
+        expected = _cpu_morph_reference(data, "erode", 4)
+        np.testing.assert_array_equal(result.to_numpy(), expected)
+
+    def test_gpu_morphology_no_ping_pong_with_nodata(self):
+        """morphology_gpu avoids D->H->D even with nodata pixels present."""
+        from vibespatial.raster.label import morphology_gpu
+        from vibespatial.residency import Residency
+
+        data = np.ones((10, 10), dtype=np.float32)
+        data[3:7, 3:7] = 0.0
+        data[5, 5] = -9999.0  # nodata pixel
+        raster = from_numpy(data, nodata=-9999.0, residency=Residency.DEVICE)
+
+        diag_baseline = len(raster.diagnostics)
+
+        result = morphology_gpu(raster, "dilate", connectivity=4)
+
+        new_events = raster.diagnostics[diag_baseline:]
+        d2h_events = [e for e in new_events if e.kind == "transfer" and "device->host" in e.detail]
+        assert len(d2h_events) == 0, (
+            f"morphology_gpu triggered {len(d2h_events)} device->host "
+            f"transfer(s) with nodata input: {d2h_events}"
+        )
+
+        # Verify result has correct runtime diagnostic
+        runtime_events = [
+            e for e in result.diagnostics if e.kind == "runtime" and "morphology_gpu" in e.detail
+        ]
+        assert len(runtime_events) == 1
+
 
 # ---------------------------------------------------------------------------
 # GPU tests: sieve filter

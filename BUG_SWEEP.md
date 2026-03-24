@@ -57,7 +57,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/kernels/focal.py:161-170`
   - GPU fills out-of-bounds halo with `0.0`; CPU uses `np.pad(mode="edge")`. Border pixels get artificially steep slopes on GPU, creating CPU/GPU inconsistency.
 
-- [~] **12. Focal std vs zonal std: ddof inconsistency**
+- [x] **12. Focal std vs zonal std: ddof inconsistency**
   - `kernels/focal.py:763` uses `n-1` (sample std); `zonal.py:160` uses `n` (population std).
   - Same library, different conventions.
 
@@ -65,19 +65,19 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
 
 ## Medium — Dispatch / Robustness Bugs
 
-- [ ] **13. `slope/aspect` auto-dispatch uses `_has_cupy()` instead of `_should_use_gpu()`**
+- [x] **13. `slope/aspect` auto-dispatch uses `_has_cupy()` instead of `_should_use_gpu()`**
   - `src/vibespatial/raster/algebra.py:1120-1121, 1170-1171`
   - Only checks if CuPy is importable, ignoring raster size thresholds and CUDA runtime availability. Will attempt GPU on tiny rasters or when CUDA runtime is unavailable.
 
-- [ ] **14. Polygonize `total_cells` integer overflow for large rasters**
+- [x] **14. Polygonize `total_cells` integer overflow for large rasters**
   - `src/vibespatial/raster/kernels/polygonize.py:68`
   - `int total_cells = cell_width * cell_height` overflows int32 for rasters > ~46K x 46K pixels.
 
-- [ ] **15. `morphology_gpu` D->H->D ping-pong**
+- [x] **15. `morphology_gpu` D->H->D ping-pong**
   - `src/vibespatial/raster/label.py:591-607`
   - Legacy path uses `raster.to_numpy()` + `cp.asarray()` instead of device residency API. The newer `_morphology_nxn_gpu` does this correctly already.
 
-- [ ] **16. Gaussian filter: no validation for `sigma=0`**
+- [x] **16. Gaussian filter: no validation for `sigma=0`**
   - `src/vibespatial/raster/algebra.py:864-873`
   - `sigma=0` causes division by zero in kernel computation, producing NaN kernel weights.
 
@@ -85,7 +85,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/polygonize.py:399-409`
   - `pad_value = min(data) - 1.0` could equal an actual data value at float64 extremes, causing that value to be silently excluded from polygonization.
 
-- [ ] **18. `_should_use_gpu` redefined with different thresholds in `algebra.py`**
+- [x] **18. `_should_use_gpu` redefined with different thresholds in `algebra.py`**
   - Line 1207: threshold 10,000; Line 1658: threshold 100,000. Later definition shadows earlier, potentially unintentional.
 
 ---

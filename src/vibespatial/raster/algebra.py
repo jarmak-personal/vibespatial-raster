@@ -1136,10 +1136,11 @@ def raster_slope(
         Digital Elevation Model raster.
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
-        Auto uses GPU when CuPy is available.
+        Auto uses GPU when CuPy and CUDA runtime are available and the
+        raster exceeds the pixel-count threshold.
     """
     if use_gpu is None:
-        use_gpu = _has_cupy()
+        use_gpu = _should_use_gpu(dem)
 
     orig_dtype = dem.dtype
 
@@ -1186,10 +1187,11 @@ def raster_aspect(
         Digital Elevation Model raster.
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
-        Auto uses GPU when CuPy is available.
+        Auto uses GPU when CuPy and CUDA runtime are available and the
+        raster exceeds the pixel-count threshold.
     """
     if use_gpu is None:
-        use_gpu = _has_cupy()
+        use_gpu = _should_use_gpu(dem)
 
     orig_dtype = dem.dtype
 
@@ -1223,19 +1225,6 @@ def raster_aspect(
 # ---------------------------------------------------------------------------
 # Hillshade (fused Horn-method slope/aspect + illumination)
 # ---------------------------------------------------------------------------
-
-
-def _should_use_gpu(raster: OwnedRasterArray) -> bool:
-    """Auto-dispatch heuristic: use GPU if CuPy is available and raster is large enough."""
-    try:
-        import cupy as cp  # noqa: F401
-
-        from vibespatial.cuda_runtime import get_cuda_runtime
-
-        runtime = get_cuda_runtime()
-        return runtime.available() and raster.pixel_count >= 10_000
-    except (ImportError, RuntimeError):
-        return False
 
 
 def _hillshade_cpu(
@@ -1676,7 +1665,7 @@ def _has_cupy() -> bool:
         return False
 
 
-def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 100_000) -> bool:
+def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 10_000) -> bool:
     """Auto-dispatch heuristic: use GPU when available and image is large enough."""
     try:
         import cupy  # noqa: F401

@@ -508,7 +508,7 @@ def polygonize_gpu(
 
     # Pre-allocate reusable device buffers for classification
     d_cell_class = cp.zeros(total_cells, dtype=cp.int32)
-    d_cell_indices = cp.arange(total_cells, dtype=cp.int32)
+    d_cell_indices = cp.arange(total_cells, dtype=cp.int64)
 
     # Accumulate edge arrays across all unique-value passes
     all_edge_x0 = []

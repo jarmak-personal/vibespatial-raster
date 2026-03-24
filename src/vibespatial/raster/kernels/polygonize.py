@@ -65,28 +65,28 @@ extern "C" __global__ void classify_cells(
     const int cell_height,
     const double target_value
 ) {
-    const int total_cells = cell_width * cell_height;
-    const int stride = blockDim.x * gridDim.x;
+    const long long total_cells = (long long)cell_width * cell_height;
+    const long long stride = blockDim.x * gridDim.x;
     const int ILP = 4;
 
-    for (int base = blockIdx.x * blockDim.x + threadIdx.x;
+    for (long long base = blockIdx.x * blockDim.x + threadIdx.x;
          base < total_cells;
          base += stride * ILP) {
         #pragma unroll
         for (int j = 0; j < ILP; j++) {
-            const int idx = base + j * stride;
+            const long long idx = base + (long long)j * stride;
             if (idx >= total_cells) break;
 
-            const int cy = idx / cell_width;
-            const int cx = idx - cy * cell_width;
+            const long long cy = idx / cell_width;
+            const long long cx = idx - cy * cell_width;
 
             // Pixel indices for the 4 corners
-            const int row0 = cy * raster_width;
-            const int row1 = row0 + raster_width;
-            const int tl = row0 + cx;
-            const int tr = row0 + cx + 1;
-            const int bl = row1 + cx;
-            const int br = row1 + cx + 1;
+            const long long row0 = cy * raster_width;
+            const long long row1 = row0 + raster_width;
+            const long long tl = row0 + cx;
+            const long long tr = row0 + cx + 1;
+            const long long bl = row1 + cx;
+            const long long br = row1 + cx + 1;
 
             const double v_tl = raster[tl];
             const double v_tr = raster[tr];
@@ -169,7 +169,7 @@ __constant__ int c_e1_end[16] = {
 };
 
 extern "C" __global__ void emit_edges(
-    const int* __restrict__ compact_cell_idx,
+    const long long* __restrict__ compact_cell_idx,
     const int* __restrict__ compact_cell_class,
     const int* __restrict__ edge_offsets,
     double* __restrict__ edge_x0,
@@ -202,11 +202,11 @@ extern "C" __global__ void emit_edges(
             const int tid = base + j * stride;
             if (tid >= n_cells) break;
 
-            const int orig_idx = compact_cell_idx[tid];
+            const long long orig_idx = compact_cell_idx[tid];
             const int cls = compact_cell_class[tid];
 
-            const int cy = orig_idx / cell_width;
-            const int cx = orig_idx - cy * cell_width;
+            const long long cy = orig_idx / cell_width;
+            const long long cx = orig_idx - cy * cell_width;
 
             // World coordinates of cell origin (cx, cy)
             const double ox = aff_a * cx + aff_b * cy + aff_c;

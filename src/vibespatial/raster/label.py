@@ -588,23 +588,27 @@ def morphology_gpu(
     t0 = time.perf_counter()
     runtime = get_cuda_runtime()
 
-    # --- Prepare data on device ---
-    data = raster.to_numpy()
-    if data.ndim == 3:
-        data = data[0]
+    # --- Prepare data on device (zero-copy: avoid D->H->D) ---
+    raster.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+    )
+    d_data = raster.device_data()
+    if d_data.ndim == 3:
+        d_data = d_data[0]
 
-    height, width = data.shape
+    height, width = d_data.shape
 
-    # Build binary foreground mask
-    binary = (data != 0).astype(np.uint8)
+    # Build binary foreground mask entirely on device
+    d_binary = (d_data != 0).astype(cp.uint8)
     if raster.nodata is not None:
         if np.isnan(raster.nodata):
-            binary &= (~np.isnan(data)).astype(np.uint8)
+            d_binary &= (~cp.isnan(d_data)).astype(cp.uint8)
         else:
-            binary &= (data != raster.nodata).astype(np.uint8)
+            d_binary &= (d_data != raster.nodata).astype(cp.uint8)
 
-    # H->D transfer
-    d_input = cp.asarray(np.ascontiguousarray(binary.ravel()))
+    # Already on device -- no transfer needed
+    d_input = d_binary.ravel()
 
     # Build structuring element
     structure = _structure_for_connectivity(connectivity).astype(np.uint8)

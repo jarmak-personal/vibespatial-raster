@@ -455,3 +455,74 @@ class TestPolygonizeGPU:
         geoms, vals = polygonize_owned(raster)
         assert geoms is not None
         assert len(geoms) >= 1
+
+    @requires_gpu
+    def test_polygonize_kernels_compile_with_long_long(self):
+        """Verify all polygonize kernels compile after int->long long fix (bug #14)."""
+        from vibespatial.cuda_runtime import (
+            get_cuda_runtime,
+            make_kernel_cache_key,
+        )
+        from vibespatial.raster.kernels.polygonize import (
+            CLASSIFY_CELLS_KERNEL_SOURCE,
+            EDGE_COUNT_KERNEL_SOURCE,
+            EMIT_EDGES_KERNEL_SOURCE,
+        )
+
+        try:
+            runtime = get_cuda_runtime()
+            cc = runtime.compute_capability
+        except RuntimeError:
+            pytest.skip("CUDA runtime not available")
+        if cc == (0, 0):
+            pytest.skip("CUDA runtime not available")
+
+        classify_key = make_kernel_cache_key("test_classify_cells_ll", CLASSIFY_CELLS_KERNEL_SOURCE)
+        classify_kernels = runtime.compile_kernels(
+            cache_key=classify_key,
+            source=CLASSIFY_CELLS_KERNEL_SOURCE,
+            kernel_names=("classify_cells",),
+        )
+        assert "classify_cells" in classify_kernels
+
+        emit_key = make_kernel_cache_key("test_emit_edges_ll", EMIT_EDGES_KERNEL_SOURCE)
+        emit_kernels = runtime.compile_kernels(
+            cache_key=emit_key,
+            source=EMIT_EDGES_KERNEL_SOURCE,
+            kernel_names=("emit_edges",),
+        )
+        assert "emit_edges" in emit_kernels
+
+        edge_count_key = make_kernel_cache_key("test_edge_count_ll", EDGE_COUNT_KERNEL_SOURCE)
+        edge_count_kernels = runtime.compile_kernels(
+            cache_key=edge_count_key,
+            source=EDGE_COUNT_KERNEL_SOURCE,
+            kernel_names=("edge_count",),
+        )
+        assert "edge_count" in edge_count_kernels
+
+    @requires_gpu
+    def test_polygonize_gpu_correctness_after_overflow_fix(self):
+        """End-to-end GPU polygonize still produces correct results after bug #14 fix."""
+        from vibespatial.raster.polygonize import polygonize_gpu
+
+        data = np.array(
+            [
+                [1, 1, 1, 2, 2],
+                [1, 1, 1, 2, 2],
+                [3, 3, 0, 2, 2],
+                [3, 3, 0, 0, 0],
+            ],
+            dtype=np.float32,
+        )
+        raster = from_numpy(data, nodata=0, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+        geoms, vals = polygonize_gpu(raster)
+
+        val_set = set(vals)
+        assert 1.0 in val_set, f"Value 1.0 not found in {val_set}"
+        assert 2.0 in val_set, f"Value 2.0 not found in {val_set}"
+        assert 3.0 in val_set, f"Value 3.0 not found in {val_set}"
+        assert len(geoms) >= 3
+        for g in geoms:
+            assert g.is_valid
+            assert not g.is_empty
