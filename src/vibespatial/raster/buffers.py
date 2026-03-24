@@ -402,8 +402,12 @@ class OwnedRasterArray:
 
         try:
             import cupy as cp
-        except ImportError:
-            return
+        except ImportError as err:
+            raise RuntimeError(
+                "Raster has device-resident data that must be transferred to "
+                "host, but CuPy is not available. Install CuPy to enable "
+                "device-to-host transfers (pip install cupy-cuda12x)."
+            ) from err
 
         t0 = time.perf_counter()
         self.data = cp.asnumpy(self.device_state.data)

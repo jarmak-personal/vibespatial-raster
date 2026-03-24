@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-24T04:01:01Z",
-  "staged_hash": "eb4aabb2d87f67aec784b4c666d131f42d6f5c4604c14e9ce520ae095628713e",
-  "files": ["src/vibespatial/raster/kernels/resample.py","src/vibespatial/raster/resample.py"],
+  "timestamp": "2026-03-24T04:24:46Z",
+  "staged_hash": "03bf2663d63f0ec86535e491c38291cdbc6eb73767e019c486f755b84b5c2d48",
+  "files": [".claude/.review-completed","BUG_SWEEP.md","src/vibespatial/raster/buffers.py","tests/test_raster_buffers.py"],
   "verdict": "LAND"
 }

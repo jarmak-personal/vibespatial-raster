@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import unittest.mock
+
 import numpy as np
 import pytest
 
 from vibespatial.raster.buffers import (
     GridSpec,
+    OwnedRasterArray,
     PolygonizeSpec,
+    RasterDeviceState,
     RasterDiagnosticKind,
     RasterMetadata,
     RasterTileSpec,
@@ -226,6 +230,108 @@ class TestNodataMaskDeviceResident:
         assert raster._host_materialized is True
         # Subsequent to_numpy should return correct data without another transfer
         np.testing.assert_array_equal(raster.to_numpy(), data_np)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_host_state raises when CuPy unavailable (bug #3 regression tests)
+# ---------------------------------------------------------------------------
+
+
+class TestEnsureHostStateCupyUnavailable:
+    """Verify _ensure_host_state raises RuntimeError when device_state exists
+    but CuPy cannot be imported.
+
+    Before the fix, _ensure_host_state silently returned without materializing
+    host data, causing to_numpy() and nodata_mask to return garbage from the
+    uninitialized np.empty() placeholder created by from_device().
+    """
+
+    @staticmethod
+    def _make_device_resident_raster() -> OwnedRasterArray:
+        """Build an OwnedRasterArray that mimics from_device() state.
+
+        We construct it manually so these tests run WITHOUT CuPy installed.
+        The key properties:
+        - device_state is not None (a mock standing in for CuPy data)
+        - _host_materialized is False
+        - data is np.empty() (uninitialized placeholder)
+        """
+        placeholder = np.empty((4, 5), dtype=np.float32)
+        mock_device_data = unittest.mock.MagicMock()
+        return OwnedRasterArray(
+            data=placeholder,
+            nodata=-9999.0,
+            dtype=np.dtype(np.float32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 0.0),
+            crs=None,
+            residency=Residency.DEVICE,
+            device_state=RasterDeviceState(data=mock_device_data),
+            _host_materialized=False,
+            diagnostics=[],
+        )
+
+    def test_ensure_host_state_raises_when_cupy_unavailable(self):
+        """_ensure_host_state must raise RuntimeError, not silently return."""
+        raster = self._make_device_resident_raster()
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            with pytest.raises(RuntimeError, match="CuPy is not available"):
+                raster._ensure_host_state()
+
+    def test_to_numpy_raises_when_cupy_unavailable(self):
+        """to_numpy delegates to _ensure_host_state, so it must also raise."""
+        raster = self._make_device_resident_raster()
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            with pytest.raises(RuntimeError, match="CuPy is not available"):
+                raster.to_numpy()
+
+    def test_nodata_mask_raises_when_cupy_unavailable(self):
+        """nodata_mask calls _ensure_host_state, so it must also raise."""
+        raster = self._make_device_resident_raster()
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            with pytest.raises(RuntimeError, match="CuPy is not available"):
+                _ = raster.nodata_mask
+
+    def test_host_materialized_raster_unaffected(self):
+        """If _host_materialized is True, _ensure_host_state short-circuits.
+
+        Even with CuPy mocked as unavailable, no error should be raised
+        because the host data is already authoritative.
+        """
+        raster = from_numpy(
+            np.arange(20, dtype=np.float32).reshape(4, 5),
+            nodata=-1.0,
+        )
+        assert raster._host_materialized is True
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            # Should NOT raise -- host data is already valid
+            raster._ensure_host_state()
+            result = raster.to_numpy()
+            np.testing.assert_array_equal(result, np.arange(20, dtype=np.float32).reshape(4, 5))
+
+    def test_no_device_state_unaffected(self):
+        """If device_state is None, _ensure_host_state short-circuits.
+
+        This covers the path where a HOST-resident raster never went to device.
+        """
+        raster = from_numpy(np.zeros((3, 3), dtype=np.float64))
+        raster._host_materialized = False  # force non-materialized for coverage
+        raster.device_state = None
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            # Should NOT raise -- no device_state means nothing to transfer
+            raster._ensure_host_state()
+
+    def test_error_message_includes_install_hint(self):
+        """Error message should include an actionable install hint."""
+        raster = self._make_device_resident_raster()
+
+        with unittest.mock.patch.dict("sys.modules", {"cupy": None}):
+            with pytest.raises(RuntimeError, match="pip install cupy"):
+                raster._ensure_host_state()
 
 
 # ---------------------------------------------------------------------------
