@@ -1622,7 +1622,7 @@ def _terrain_derivative_gpu(
     deriv_names = {_DERIV_TRI: "TRI", _DERIV_TPI: "TPI", _DERIV_CURV: "curvature"}
     result = from_numpy(
         host_result,
-        nodata=dem.nodata,
+        nodata=nodata_val,
         affine=dem.affine,
         crs=dem.crs,
     )
@@ -2058,7 +2058,7 @@ def _terrain_derivative_cpu(
 
     return from_numpy(
         output,
-        nodata=dem.nodata,
+        nodata=nodata_val,
         affine=dem.affine,
         crs=dem.crs,
     )

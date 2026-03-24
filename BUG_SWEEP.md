@@ -25,7 +25,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/histogram.py:491-500`
   - `nodata_val` passed as `KERNEL_PARAM_I32` (4 bytes) but kernel declares `const unsigned char nodata_val` (1 byte). Same class of bug as #1.
 
-- [ ] **5. Terrain derivative CPU: border pixels get -9999 but `nodata=None`**
+- [x] **5. Terrain derivative CPU: border pixels get -9999 but `nodata=None`**
   - `src/vibespatial/raster/algebra.py:2043-2059`
   - Output initialized to `-9999.0`, border pixels never overwritten, but result declares `nodata=None`. Downstream consumers can't distinguish border artifacts from real data.
 

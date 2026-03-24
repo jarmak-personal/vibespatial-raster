@@ -279,6 +279,92 @@ class TestCurvature_CPU:
 
 
 # ---------------------------------------------------------------------------
+# Border nodata metadata tests (Bug #5)
+# ---------------------------------------------------------------------------
+
+
+class TestBorderNodataMetadata:
+    """Verify that terrain derivative output declares nodata correctly.
+
+    When the input DEM has nodata=None, border pixels are filled with the
+    sentinel -9999.0. The output must declare nodata=-9999.0 so downstream
+    consumers can identify border artifacts. When the input DEM has an
+    explicit nodata value, that value must be propagated to the output.
+    """
+
+    def test_tri_nodata_declared_when_input_has_no_nodata(self, flat_dem):
+        """TRI output must declare nodata=-9999.0 for border sentinel."""
+        from vibespatial.raster.algebra import raster_tri
+
+        assert flat_dem.nodata is None  # precondition
+        result = raster_tri(flat_dem, use_gpu=False)
+        assert result.nodata == -9999.0
+        # Border pixels match the declared nodata
+        data = result.to_numpy()
+        assert data[0, 0] == result.nodata
+        assert data[0, 5] == result.nodata
+        assert data[9, 9] == result.nodata
+
+    def test_tpi_nodata_declared_when_input_has_no_nodata(self, flat_dem):
+        """TPI output must declare nodata=-9999.0 for border sentinel."""
+        from vibespatial.raster.algebra import raster_tpi
+
+        assert flat_dem.nodata is None
+        result = raster_tpi(flat_dem, use_gpu=False)
+        assert result.nodata == -9999.0
+        data = result.to_numpy()
+        assert data[0, 0] == result.nodata
+
+    def test_curvature_nodata_declared_when_input_has_no_nodata(self, flat_dem):
+        """Curvature output must declare nodata=-9999.0 for border sentinel."""
+        from vibespatial.raster.algebra import raster_curvature
+
+        assert flat_dem.nodata is None
+        result = raster_curvature(flat_dem, use_gpu=False)
+        assert result.nodata == -9999.0
+        data = result.to_numpy()
+        assert data[0, 0] == result.nodata
+
+    def test_tri_preserves_explicit_nodata(self, nodata_dem):
+        """When input DEM has explicit nodata, output preserves it."""
+        from vibespatial.raster.algebra import raster_tri
+
+        assert nodata_dem.nodata == -9999.0  # precondition
+        result = raster_tri(nodata_dem, use_gpu=False)
+        assert result.nodata == -9999.0
+
+    def test_border_nodata_mask_consistency(self, flat_dem):
+        """All border pixels must be identifiable via nodata_mask."""
+        from vibespatial.raster.algebra import raster_tri
+
+        result = raster_tri(flat_dem, use_gpu=False)
+        data = result.to_numpy()
+        nodata_val = result.nodata
+        assert nodata_val is not None
+
+        # Entire border ring should be nodata
+        h, w = data.shape
+        border_mask = np.zeros((h, w), dtype=bool)
+        border_mask[0, :] = True  # top row
+        border_mask[-1, :] = True  # bottom row
+        border_mask[:, 0] = True  # left col
+        border_mask[:, -1] = True  # right col
+
+        np.testing.assert_array_equal(data[border_mask], nodata_val)
+        # Interior should NOT be nodata (flat surface -> all valid interior)
+        interior = data[1:-1, 1:-1]
+        assert not np.any(interior == nodata_val)
+
+    def test_metadata_preservation(self, flat_dem):
+        """Affine and CRS must be preserved through terrain derivatives."""
+        from vibespatial.raster.algebra import raster_tri
+
+        result = raster_tri(flat_dem, use_gpu=False)
+        assert result.affine == flat_dem.affine
+        assert result.crs == flat_dem.crs
+
+
+# ---------------------------------------------------------------------------
 # Auto-dispatch tests (work with or without GPU)
 # ---------------------------------------------------------------------------
 
@@ -428,6 +514,37 @@ class TestCurvature_GPU:
         dem = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 5.0))
         gpu = raster_curvature(dem, use_gpu=True)
         np.testing.assert_almost_equal(gpu.to_numpy()[2, 2], 1200.0)
+
+
+# ---------------------------------------------------------------------------
+# GPU border nodata metadata tests (Bug #5)
+# ---------------------------------------------------------------------------
+
+
+@requires_gpu
+class TestBorderNodataMetadata_GPU:
+    """GPU path must also declare nodata correctly for border sentinels."""
+
+    @pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
+    def test_tri_gpu_nodata_declared_when_input_has_no_nodata(self, flat_dem):
+        """GPU TRI output must declare nodata=-9999.0 for border sentinel."""
+        from vibespatial.raster.algebra import raster_tri
+
+        assert flat_dem.nodata is None
+        result = raster_tri(flat_dem, use_gpu=True)
+        assert result.nodata == -9999.0
+        data = result.to_numpy()
+        assert data[0, 0] == result.nodata
+
+    @pytest.mark.skipif(not HAS_GPU, reason="CuPy not available")
+    def test_gpu_cpu_nodata_metadata_parity(self, flat_dem):
+        """GPU and CPU paths must produce identical nodata metadata."""
+        from vibespatial.raster.algebra import raster_tri
+
+        cpu = raster_tri(flat_dem, use_gpu=False)
+        gpu = raster_tri(flat_dem, use_gpu=True)
+        assert cpu.nodata == gpu.nodata
+        np.testing.assert_array_almost_equal(gpu.to_numpy(), cpu.to_numpy())
 
 
 # ---------------------------------------------------------------------------
