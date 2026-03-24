@@ -16,14 +16,15 @@ void histogram_remap(
     const unsigned char* __restrict__ lut,
     const unsigned char* __restrict__ nodata_mask,
     const int n,
-    const unsigned char nodata_val
+    const int nodata_val
 ) {
+    const unsigned char nd = (unsigned char)nodata_val;
     const int stride = blockDim.x * gridDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
          idx < n;
          idx += stride) {
         if (nodata_mask != nullptr && nodata_mask[idx]) {
-            output[idx] = nodata_val;
+            output[idx] = nd;
         } else {
             output[idx] = lut[input[idx]];
         }

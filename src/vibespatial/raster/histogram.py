@@ -496,7 +496,7 @@ def _raster_histogram_equalize_gpu(
             KERNEL_PARAM_PTR,  # lut
             KERNEL_PARAM_PTR,  # nodata_mask
             KERNEL_PARAM_I32,  # n
-            KERNEL_PARAM_I32,  # nodata_val (passed as int, kernel reads as unsigned char)
+            KERNEL_PARAM_I32,  # nodata_val (kernel declares const int, casts to uchar internally)
         ),
     )
 

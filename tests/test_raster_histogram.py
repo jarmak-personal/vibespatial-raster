@@ -322,6 +322,39 @@ class TestRasterHistogramEqualizeGPU:
         # No single bin should dominate
         assert counts.max() < raster_float.pixel_count * 0.5
 
+    def test_gpu_nodata_preserved_uint8(self, raster_uint8_nodata):
+        """Regression test for kernel param type mismatch (bug #4).
+
+        The histogram remap kernel declares nodata_val as const int and
+        casts to unsigned char internally.  Before the fix, the host
+        passed KERNEL_PARAM_I32 (4 bytes) for a kernel parameter declared
+        as unsigned char (1 byte), corrupting the nodata value written
+        to output pixels.  This test verifies nodata pixels get the
+        correct sentinel value after equalization.
+        """
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        result = raster_histogram_equalize(raster_uint8_nodata, use_gpu=True)
+        data = result.to_numpy()
+        # The input nodata sentinel is 0.  The nodata pixel is at [1,1].
+        # After equalization, nodata pixels must still hold the sentinel.
+        assert data[1, 1] == 0, f"nodata pixel should be 0, got {data[1, 1]}"
+        # Valid pixels should have been remapped (not all zeros)
+        valid_mask = np.array([[True, True, True], [True, False, True], [True, True, True]])
+        assert data[valid_mask].sum() > 0, "valid pixels should have nonzero equalized values"
+
+    def test_gpu_equalize_matches_cpu_with_nodata(self, raster_uint8_nodata):
+        """GPU and CPU equalization should produce identical output for uint8 with nodata."""
+        from vibespatial.raster.histogram import raster_histogram_equalize
+
+        cpu_result = raster_histogram_equalize(raster_uint8_nodata, use_gpu=False)
+        gpu_result = raster_histogram_equalize(raster_uint8_nodata, use_gpu=True)
+        np.testing.assert_array_equal(
+            cpu_result.to_numpy(),
+            gpu_result.to_numpy(),
+            err_msg="GPU and CPU histogram equalize should match for uint8 with nodata",
+        )
+
 
 # ---------------------------------------------------------------------------
 # GPU tests — raster_percentile

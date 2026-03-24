@@ -21,7 +21,7 @@ Comprehensive audit of vibespatial-raster by 6 parallel agents (GPU kernel, Pyth
   - `src/vibespatial/raster/buffers.py:393-397`
   - If `device_state` exists but CuPy can't import, function returns without materializing host data. `to_numpy()` then returns uninitialized garbage silently.
 
-- [ ] **4. Histogram equalize kernel param type mismatch**
+- [x] **4. Histogram equalize kernel param type mismatch**
   - `src/vibespatial/raster/histogram.py:491-500`
   - `nodata_val` passed as `KERNEL_PARAM_I32` (4 bytes) but kernel declares `const unsigned char nodata_val` (1 byte). Same class of bug as #1.
 
