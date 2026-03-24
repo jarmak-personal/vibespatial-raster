@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-23T13:49:28Z",
-  "staged_hash": "6738eec8aa2ae03f5030983371a69f9911d6ce4d5a792d93d1b48af9bde14e64",
-  "files": [".claude/skills/gpu-kernel/SKILL.md","AGENTS.md","src/vibespatial/raster/algebra.py","src/vibespatial/raster/histogram.py","src/vibespatial/raster/hydrology.py","src/vibespatial/raster/label.py","tests/test_raster_histogram.py"],
+  "timestamp": "2026-03-24T04:01:01Z",
+  "staged_hash": "eb4aabb2d87f67aec784b4c666d131f42d6f5c4604c14e9ce520ae095628713e",
+  "files": ["src/vibespatial/raster/kernels/resample.py","src/vibespatial/raster/resample.py"],
   "verdict": "LAND"
 }

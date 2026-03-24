@@ -119,21 +119,18 @@ def _should_use_gpu(raster: OwnedRasterArray, threshold: int = 10_000) -> bool:
 
 
 def _dtype_to_kernel_param_type(dtype: np.dtype):
-    """Return the kernel parameter type constant for the given numpy dtype."""
-    from vibespatial.cuda_runtime import KERNEL_PARAM_F64, KERNEL_PARAM_I32
+    """Return the kernel parameter type constant for nodata_val.
 
-    # Map numpy dtypes to ctypes for the nodata_val kernel parameter.
-    # Integer dtypes use c_int (KERNEL_PARAM_I32), floats use c_double
-    # (KERNEL_PARAM_F64).
-    if np.issubdtype(dtype, np.floating):
-        return KERNEL_PARAM_F64
-    elif dtype == np.uint8:
-        # unsigned char fits in c_int for kernel param passing
-        return KERNEL_PARAM_I32
-    elif dtype == np.int16:
-        return KERNEL_PARAM_I32
-    else:
-        return KERNEL_PARAM_F64  # fallback for upcast-to-f64 path
+    All resample kernel variants now declare ``nodata_val`` as
+    ``const double`` regardless of the raster dtype (the cast to the
+    native type happens inside the kernel).  The host therefore always
+    passes ``KERNEL_PARAM_F64`` (``ctypes.c_double``, 8 bytes) so that
+    the parameter size matches the kernel declaration and does not
+    corrupt the subsequent ``has_nodata`` parameter.
+    """
+    from vibespatial.cuda_runtime import KERNEL_PARAM_F64
+
+    return KERNEL_PARAM_F64
 
 
 # ---------------------------------------------------------------------------
@@ -208,12 +205,14 @@ def _resample_gpu(
     # Compute composed inverse affine: dst pixel -> src pixel
     inv = _compose_pixel_to_pixel(raster.affine, target_grid.affine)
 
-    # Nodata value for the kernel (cast to working dtype)
+    # Nodata value for the kernel.  The kernel always receives nodata_val
+    # as ``const double`` and casts internally, so pass a Python float
+    # which ctypes packs as c_double (8 bytes).
     if raster.nodata is not None:
-        nodata_val = working_dtype.type(raster.nodata)
+        nodata_val = float(raster.nodata)
     else:
         # Use 0 as placeholder when no nodata (never written since has_nodata=0)
-        nodata_val = working_dtype.type(0)
+        nodata_val = 0.0
 
     # Compile kernels
     runtime = get_cuda_runtime()

@@ -60,9 +60,10 @@ void resample_nearest(
     const double inv_d,
     const double inv_e,
     const double inv_f,
-    const {dtype} nodata_val,
+    const double nodata_val,
     const int has_nodata
 ) {{
+    const {dtype} nd = ({dtype})nodata_val;
     const int total = dst_width * dst_height;
     const int stride = blockDim.x * gridDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -85,11 +86,11 @@ void resample_nearest(
         int sr = (int)floor(src_row_f);
 
         if (sc < 0 || sc >= src_width || sr < 0 || sr >= src_height) {{
-            dst[idx] = nodata_val;
+            dst[idx] = nd;
         }} else {{
             long long si = (long long)sr * src_width + sc;
             if (has_nodata && src_nodata_mask != nullptr && src_nodata_mask[si]) {{
-                dst[idx] = nodata_val;
+                dst[idx] = nd;
             }} else {{
                 dst[idx] = src[si];
             }}
@@ -115,9 +116,10 @@ void resample_bilinear(
     const double inv_d,
     const double inv_e,
     const double inv_f,
-    const {dtype} nodata_val,
+    const double nodata_val,
     const int has_nodata
 ) {{
+    const {dtype} nd = ({dtype})nodata_val;
     const int total = dst_width * dst_height;
     const int stride = blockDim.x * gridDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -147,7 +149,7 @@ void resample_bilinear(
 
         // Bounds check: all 4 source pixels must be in bounds
         if (x0 < 0 || x1 >= src_width || y0 < 0 || y1 >= src_height) {{
-            dst[idx] = nodata_val;
+            dst[idx] = nd;
             continue;
         }}
 
@@ -160,7 +162,7 @@ void resample_bilinear(
         if (has_nodata && src_nodata_mask != nullptr) {{
             if (src_nodata_mask[i00] || src_nodata_mask[i01] ||
                 src_nodata_mask[i10] || src_nodata_mask[i11]) {{
-                dst[idx] = nodata_val;
+                dst[idx] = nd;
                 continue;
             }}
         }}
@@ -197,9 +199,10 @@ void resample_bicubic(
     const double inv_d,
     const double inv_e,
     const double inv_f,
-    const {dtype} nodata_val,
+    const double nodata_val,
     const int has_nodata
 ) {{
+    const {dtype} nd = ({dtype})nodata_val;
     const int total = dst_width * dst_height;
     const int stride = blockDim.x * gridDim.x;
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -227,7 +230,7 @@ void resample_bicubic(
         // 4x4 neighborhood bounds check
         if (x0 < 0 || (x0 + 3) >= src_width ||
             y0 < 0 || (y0 + 3) >= src_height) {{
-            dst[idx] = nodata_val;
+            dst[idx] = nd;
             continue;
         }}
 
@@ -241,7 +244,7 @@ void resample_bicubic(
                 }}
             }}
             if (any_nodata) {{
-                dst[idx] = nodata_val;
+                dst[idx] = nd;
                 continue;
             }}
         }}
