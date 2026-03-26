@@ -67,18 +67,29 @@ def _to_device_data(raster: OwnedRasterArray):
     return raster.device_data()
 
 
-def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
-    """Apply a binary element-wise operation on two rasters.
+def _should_use_gpu_algebra(
+    *rasters: OwnedRasterArray,
+    threshold: int = 100_000,
+) -> bool:
+    """Auto-dispatch heuristic for local algebra operations."""
+    try:
+        import cupy  # noqa: F401
 
-    Nodata masking is applied in a single pass here.  The ``op_func`` must
-    **not** replace inf/nan with the nodata sentinel — that is handled
-    uniformly by this function so that legitimate computed values equal to
-    the nodata sentinel are never spuriously masked.
-    """
-    if a.shape != b.shape:
-        raise ValueError(f"raster shapes must match for {op_name}: {a.shape} vs {b.shape}")
+        from vibespatial.cuda_runtime import get_cuda_runtime
 
+        runtime = get_cuda_runtime()
+        if not runtime.available():
+            return False
+        return any(r.pixel_count >= threshold for r in rasters)
+    except (ImportError, RuntimeError):
+        return False
+
+
+def _binary_op_gpu(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
+    """GPU path for binary element-wise operations using CuPy."""
     import cupy as cp
+
+    t0 = time.perf_counter()
 
     da = _to_device_data(a)
     db = _to_device_data(b)
@@ -108,16 +119,91 @@ def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
             result_device = cp.where(bad_values, 0, result_device)
             nodata = 0
 
+    elapsed = time.perf_counter() - t0
+
     # Build result as DEVICE-resident (zero-copy, no D→H transfer)
     result = from_device(result_device, nodata=nodata, affine=a.affine, crs=a.crs)
     result.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
-            detail=f"raster_{op_name} shape={a.shape} dtype={a.dtype}",
+            detail=f"raster_{op_name} [GPU] shape={a.shape} dtype={a.dtype} elapsed={elapsed:.4f}s",
             residency=Residency.DEVICE,
         )
     )
     return result
+
+
+def _binary_op_cpu(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, np_op_func):
+    """CPU fallback for binary element-wise operations using numpy."""
+    t0 = time.perf_counter()
+
+    da = a.to_numpy()
+    db = b.to_numpy()
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result_data = np_op_func(da, db)
+
+    # Determine the output nodata value
+    nodata = a.nodata if a.nodata is not None else b.nodata
+
+    # Build a single combined mask covering:
+    #   1. Input nodata pixels (either input is nodata -> output is nodata)
+    #   2. Inf/NaN produced by the operation (e.g., division by zero)
+    bad_values = np.logical_or(np.isinf(result_data), np.isnan(result_data))
+    if nodata is not None:
+        mask_a = a.nodata_mask
+        mask_b = b.nodata_mask
+        combined_mask = np.logical_or(np.logical_or(mask_a, mask_b), bad_values)
+        result_data = np.where(combined_mask, nodata, result_data)
+    elif np.any(bad_values):
+        # No nodata sentinel available — use NaN for float, 0 for integer
+        if np.issubdtype(result_data.dtype, np.floating):
+            result_data = np.where(bad_values, np.nan, result_data)
+            nodata = float("nan")
+        else:
+            result_data = np.where(bad_values, 0, result_data)
+            nodata = 0
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(result_data, nodata=nodata, affine=a.affine, crs=a.crs)
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_{op_name} [CPU] shape={a.shape} dtype={a.dtype} elapsed={elapsed:.4f}s",
+            residency=Residency.HOST,
+        )
+    )
+    return result
+
+
+def _binary_op(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    op_name: str,
+    gpu_op_func,
+    np_op_func,
+    *,
+    use_gpu: bool | None = None,
+):
+    """Apply a binary element-wise operation on two rasters.
+
+    Dispatches to GPU or CPU path based on ``use_gpu``.  Nodata masking is
+    applied in a single pass on both paths.  The ``op_func`` must **not**
+    replace inf/nan with the nodata sentinel — that is handled uniformly
+    so that legitimate computed values equal to the nodata sentinel are
+    never spuriously masked.
+    """
+    if a.shape != b.shape:
+        raise ValueError(f"raster shapes must match for {op_name}: {a.shape} vs {b.shape}")
+
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_algebra(a, b)
+
+    if use_gpu:
+        return _binary_op_gpu(a, b, op_name, gpu_op_func)
+    else:
+        return _binary_op_cpu(a, b, op_name, np_op_func)
 
 
 # ---------------------------------------------------------------------------
@@ -125,56 +211,83 @@ def _binary_op(a: OwnedRasterArray, b: OwnedRasterArray, op_name: str, op_func):
 # ---------------------------------------------------------------------------
 
 
-def raster_add(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
+def raster_add(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
     """Element-wise addition of two rasters."""
-    import cupy as cp
 
-    return _binary_op(a, b, "add", cp.add)
+    def _gpu_add(da, db):
+        import cupy as cp
+
+        return cp.add(da, db)
+
+    return _binary_op(a, b, "add", _gpu_add, np.add, use_gpu=use_gpu)
 
 
-def raster_subtract(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
+def raster_subtract(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
     """Element-wise subtraction of two rasters."""
-    import cupy as cp
 
-    return _binary_op(a, b, "subtract", cp.subtract)
+    def _gpu_subtract(da, db):
+        import cupy as cp
+
+        return cp.subtract(da, db)
+
+    return _binary_op(a, b, "subtract", _gpu_subtract, np.subtract, use_gpu=use_gpu)
 
 
-def raster_multiply(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
+def raster_multiply(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
     """Element-wise multiplication of two rasters."""
-    import cupy as cp
 
-    return _binary_op(a, b, "multiply", cp.multiply)
+    def _gpu_multiply(da, db):
+        import cupy as cp
+
+        return cp.multiply(da, db)
+
+    return _binary_op(a, b, "multiply", _gpu_multiply, np.multiply, use_gpu=use_gpu)
 
 
-def raster_divide(a: OwnedRasterArray, b: OwnedRasterArray) -> OwnedRasterArray:
+def raster_divide(
+    a: OwnedRasterArray,
+    b: OwnedRasterArray,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
     """Element-wise division of two rasters. Division by zero yields nodata."""
-    import cupy as cp
 
-    def safe_divide(da, db):
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return cp.true_divide(da, db)
+    def _gpu_safe_divide(da, db):
+        import cupy as cp
 
-    return _binary_op(a, b, "divide", safe_divide)
+        return cp.true_divide(da, db)
+
+    def _cpu_safe_divide(da, db):
+        return np.true_divide(da, db)
+
+    return _binary_op(a, b, "divide", _gpu_safe_divide, _cpu_safe_divide, use_gpu=use_gpu)
 
 
-def raster_apply(
+def _raster_apply_gpu(
     raster: OwnedRasterArray,
     func,
     *,
     nodata: float | int | None = None,
 ) -> OwnedRasterArray:
-    """Apply an arbitrary element-wise function to a raster on GPU.
-
-    Parameters
-    ----------
-    raster : OwnedRasterArray
-        Input raster.
-    func : callable
-        Function that accepts a CuPy array and returns a CuPy array.
-    nodata : float | int | None
-        Nodata value for the output. If None, inherits from input.
-    """
+    """GPU path: apply an element-wise function using CuPy."""
     import cupy as cp
+
+    t0 = time.perf_counter()
 
     d = _to_device_data(raster)
     result_device = func(d)
@@ -185,24 +298,89 @@ def raster_apply(
         if mask is not None:
             result_device = cp.where(mask, out_nodata, result_device)
 
-    return from_device(result_device, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
+    elapsed = time.perf_counter() - t0
+
+    result = from_device(result_device, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_apply [GPU] shape={raster.shape} dtype={raster.dtype} elapsed={elapsed:.4f}s",
+            residency=Residency.DEVICE,
+        )
+    )
+    return result
 
 
-def raster_where(
+def _raster_apply_cpu(
+    raster: OwnedRasterArray,
+    func,
+    *,
+    nodata: float | int | None = None,
+) -> OwnedRasterArray:
+    """CPU fallback: apply an element-wise function using numpy."""
+    t0 = time.perf_counter()
+
+    data = raster.to_numpy()
+    result_data = func(data)
+
+    out_nodata = nodata if nodata is not None else raster.nodata
+    if out_nodata is not None and raster.nodata is not None:
+        mask = raster.nodata_mask
+        result_data = np.where(mask, out_nodata, result_data)
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(result_data, nodata=out_nodata, affine=raster.affine, crs=raster.crs)
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_apply [CPU] shape={raster.shape} dtype={raster.dtype} elapsed={elapsed:.4f}s",
+            residency=Residency.HOST,
+        )
+    )
+    return result
+
+
+def raster_apply(
+    raster: OwnedRasterArray,
+    func,
+    *,
+    nodata: float | int | None = None,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Apply an arbitrary element-wise function to a raster.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster.
+    func : callable
+        Function that accepts a numpy or CuPy array and returns an array
+        of the same type. When ``use_gpu=True`` this must accept CuPy
+        arrays; when ``use_gpu=False`` it must accept numpy arrays.
+    nodata : float | int | None
+        Nodata value for the output. If None, inherits from input.
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_algebra(raster)
+
+    if use_gpu:
+        return _raster_apply_gpu(raster, func, nodata=nodata)
+    else:
+        return _raster_apply_cpu(raster, func, nodata=nodata)
+
+
+def _raster_where_gpu(
     condition: OwnedRasterArray,
     true_val: OwnedRasterArray | float | int,
     false_val: OwnedRasterArray | float | int,
 ) -> OwnedRasterArray:
-    """Element-wise conditional selection.
-
-    Parameters
-    ----------
-    condition : OwnedRasterArray
-        Boolean-like raster (nonzero = True).
-    true_val, false_val : OwnedRasterArray or scalar
-        Values to use where condition is True/False.
-    """
+    """GPU path: element-wise conditional selection using CuPy."""
     import cupy as cp
+
+    t0 = time.perf_counter()
 
     cond_d = _to_device_data(condition)
     cond_bool = cond_d.astype(cp.bool_)
@@ -219,33 +397,120 @@ def raster_where(
 
     result_device = cp.where(cond_bool, tv, fv)
 
+    # Propagate nodata from condition and raster operands
     nodata = condition.nodata
-    return from_device(result_device, nodata=nodata, affine=condition.affine, crs=condition.crs)
+    if nodata is not None:
+        mask = condition.device_nodata_mask()
+        if mask is not None:
+            result_device = cp.where(mask, nodata, result_device)
+    if isinstance(true_val, OwnedRasterArray) and true_val.nodata is not None:
+        tmask = true_val.device_nodata_mask()
+        if tmask is not None and nodata is not None:
+            result_device = cp.where(cp.logical_and(cond_bool, tmask), nodata, result_device)
+    if isinstance(false_val, OwnedRasterArray) and false_val.nodata is not None:
+        fmask = false_val.device_nodata_mask()
+        if fmask is not None and nodata is not None:
+            result_device = cp.where(cp.logical_and(~cond_bool, fmask), nodata, result_device)
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_device(result_device, nodata=nodata, affine=condition.affine, crs=condition.crs)
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_where [GPU] shape={condition.shape} elapsed={elapsed:.4f}s",
+            residency=Residency.DEVICE,
+        )
+    )
+    return result
 
 
-def raster_classify(
+def _raster_where_cpu(
+    condition: OwnedRasterArray,
+    true_val: OwnedRasterArray | float | int,
+    false_val: OwnedRasterArray | float | int,
+) -> OwnedRasterArray:
+    """CPU fallback: element-wise conditional selection using numpy."""
+    t0 = time.perf_counter()
+
+    cond_data = condition.to_numpy()
+    cond_bool = cond_data.astype(bool)
+
+    if isinstance(true_val, OwnedRasterArray):
+        tv = true_val.to_numpy()
+    else:
+        tv = true_val
+
+    if isinstance(false_val, OwnedRasterArray):
+        fv = false_val.to_numpy()
+    else:
+        fv = false_val
+
+    result_data = np.where(cond_bool, tv, fv)
+
+    # Propagate nodata from condition and raster operands
+    nodata = condition.nodata
+    if nodata is not None:
+        mask = condition.nodata_mask
+        result_data = np.where(mask, nodata, result_data)
+    if isinstance(true_val, OwnedRasterArray) and true_val.nodata is not None:
+        tmask = true_val.nodata_mask
+        if nodata is not None:
+            result_data = np.where(np.logical_and(cond_bool, tmask), nodata, result_data)
+    if isinstance(false_val, OwnedRasterArray) and false_val.nodata is not None:
+        fmask = false_val.nodata_mask
+        if nodata is not None:
+            result_data = np.where(np.logical_and(~cond_bool, fmask), nodata, result_data)
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(result_data, nodata=nodata, affine=condition.affine, crs=condition.crs)
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_where [CPU] shape={condition.shape} elapsed={elapsed:.4f}s",
+            residency=Residency.HOST,
+        )
+    )
+    return result
+
+
+def raster_where(
+    condition: OwnedRasterArray,
+    true_val: OwnedRasterArray | float | int,
+    false_val: OwnedRasterArray | float | int,
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Element-wise conditional selection.
+
+    Parameters
+    ----------
+    condition : OwnedRasterArray
+        Boolean-like raster (nonzero = True).
+    true_val, false_val : OwnedRasterArray or scalar
+        Values to use where condition is True/False.
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+    """
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_algebra(condition)
+
+    if use_gpu:
+        return _raster_where_gpu(condition, true_val, false_val)
+    else:
+        return _raster_where_cpu(condition, true_val, false_val)
+
+
+def _raster_classify_gpu(
     raster: OwnedRasterArray,
     bins: list[float],
     labels: list[int | float],
 ) -> OwnedRasterArray:
-    """Reclassify raster values into discrete classes.
-
-    Parameters
-    ----------
-    raster : OwnedRasterArray
-        Input raster.
-    bins : list[float]
-        Bin edges (N edges define N-1 bins). Values below bins[0] get labels[0],
-        values in [bins[i], bins[i+1]) get labels[i+1], etc.
-    labels : list[int | float]
-        Class labels. Must have len(bins) + 1 elements.
-    """
+    """GPU path: reclassify raster values using CuPy."""
     import cupy as cp
 
-    if len(labels) != len(bins) + 1:
-        raise ValueError(
-            f"labels must have len(bins)+1={len(bins) + 1} elements, got {len(labels)}"
-        )
+    t0 = time.perf_counter()
 
     d = _to_device_data(raster)
     bins_d = cp.asarray(bins, dtype=d.dtype)
@@ -260,12 +525,95 @@ def raster_classify(
         if mask is not None:
             result_device = cp.where(mask, raster.nodata, result_device)
 
-    return from_device(
+    elapsed = time.perf_counter() - t0
+
+    result = from_device(
         result_device.astype(cp.float64, copy=False),
         nodata=raster.nodata,
         affine=raster.affine,
         crs=raster.crs,
     )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_classify [GPU] shape={raster.shape} bins={len(bins)} elapsed={elapsed:.4f}s",
+            residency=Residency.DEVICE,
+        )
+    )
+    return result
+
+
+def _raster_classify_cpu(
+    raster: OwnedRasterArray,
+    bins: list[float],
+    labels: list[int | float],
+) -> OwnedRasterArray:
+    """CPU fallback: reclassify raster values using numpy."""
+    t0 = time.perf_counter()
+
+    data = raster.to_numpy()
+    bins_arr = np.asarray(bins, dtype=data.dtype)
+    labels_arr = np.asarray(labels, dtype=np.float64)
+
+    indices = np.digitize(data.ravel(), bins_arr).reshape(data.shape)
+    result_data = labels_arr[indices]
+
+    # Preserve nodata
+    if raster.nodata is not None:
+        mask = raster.nodata_mask
+        result_data = np.where(mask, raster.nodata, result_data)
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(
+        result_data.astype(np.float64, copy=False),
+        nodata=raster.nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=f"raster_classify [CPU] shape={raster.shape} bins={len(bins)} elapsed={elapsed:.4f}s",
+            residency=Residency.HOST,
+        )
+    )
+    return result
+
+
+def raster_classify(
+    raster: OwnedRasterArray,
+    bins: list[float],
+    labels: list[int | float],
+    *,
+    use_gpu: bool | None = None,
+) -> OwnedRasterArray:
+    """Reclassify raster values into discrete classes.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster.
+    bins : list[float]
+        Bin edges (N edges define N-1 bins). Values below bins[0] get labels[0],
+        values in [bins[i], bins[i+1]) get labels[i+1], etc.
+    labels : list[int | float]
+        Class labels. Must have len(bins) + 1 elements.
+    use_gpu : bool or None
+        Force GPU (True), force CPU (False), or auto-detect (None).
+    """
+    if len(labels) != len(bins) + 1:
+        raise ValueError(
+            f"labels must have len(bins)+1={len(bins) + 1} elements, got {len(labels)}"
+        )
+
+    if use_gpu is None:
+        use_gpu = _should_use_gpu_algebra(raster)
+
+    if use_gpu:
+        return _raster_classify_gpu(raster, bins, labels)
+    else:
+        return _raster_classify_cpu(raster, bins, labels)
 
 
 # ---------------------------------------------------------------------------

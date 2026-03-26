@@ -446,6 +446,43 @@ def _zonal_stats_gpu(
 # ---------------------------------------------------------------------------
 
 
+def _zonal_stats_single_band(
+    zones: OwnedRasterArray,
+    values: OwnedRasterArray,
+    requested: tuple[ZonalStatistic, ...],
+    use_gpu: bool,
+) -> pd.DataFrame:
+    """Dispatch a single-band zonal stats computation (GPU or CPU)."""
+    if use_gpu:
+        return _zonal_stats_gpu(zones, values, requested)
+    return _zonal_stats_cpu(zones, values, requested)
+
+
+def _extract_single_band(
+    values: OwnedRasterArray,
+    band_index: int,
+    use_gpu: bool,
+) -> OwnedRasterArray:
+    """Extract a single band from a multiband values raster.
+
+    Uses the zero-copy GPU view when on the GPU path, and a host-side
+    slice for the CPU path.
+    """
+    if use_gpu:
+        from vibespatial.raster.dispatch import _single_band_view_gpu
+
+        values.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="zonal_stats multiband: transfer values to device for per-band dispatch",
+        )
+        return _single_band_view_gpu(values, band_index)
+    else:
+        from vibespatial.raster.dispatch import _single_band_view_cpu
+
+        return _single_band_view_cpu(values, band_index)
+
+
 def zonal_stats(
     zones: OwnedRasterArray,
     values: OwnedRasterArray,
@@ -458,9 +495,13 @@ def zonal_stats(
     Parameters
     ----------
     zones : OwnedRasterArray
-        Integer label raster defining zones. Each unique nonzero value is a zone.
+        Integer label raster defining zones (must be single-band). Each
+        unique nonzero value is a zone.
     values : OwnedRasterArray
         Value raster to aggregate. Must have same height/width as zones.
+        May be single-band or multiband. For multiband values, per-band
+        statistics are computed and returned with ``band_N_`` prefixed
+        column names (e.g. ``band_1_mean``, ``band_2_mean``).
     stats : ZonalSpec or list[str] or None
         Statistics to compute. Default: count, sum, mean, min, max.
     use_gpu : bool or None
@@ -470,14 +511,12 @@ def zonal_stats(
     Returns
     -------
     pd.DataFrame
-        One row per zone, columns for zone label and each requested statistic.
+        One row per zone. For single-band values, columns are ``zone``
+        plus each requested statistic name. For multiband values, columns
+        are ``zone`` plus ``band_N_<stat>`` for each band and statistic.
     """
     if zones.band_count != 1:
         raise ValueError("zones raster must be single-band")
-    if values.band_count != 1:
-        raise ValueError(
-            "values raster must be single-band. For multiband, select a band first via indexing."
-        )
 
     if zones.height != values.height or zones.width != values.width:
         raise ValueError(
@@ -499,20 +538,41 @@ def zonal_stats(
         use_gpu = _should_use_gpu(zones, values)
 
     t0 = time.perf_counter()
-    if use_gpu:
-        result = _zonal_stats_gpu(zones, values, requested)
+
+    n_bands = values.band_count
+
+    if n_bands == 1:
+        # Single-band: unchanged behaviour, no column prefix
+        result = _zonal_stats_single_band(zones, values, requested, use_gpu)
     else:
-        result = _zonal_stats_cpu(zones, values, requested)
+        # Multiband: per-band dispatch, merge with band_N_ prefix
+        band_dfs: list[pd.DataFrame] = []
+        for band_idx in range(n_bands):
+            band_values = _extract_single_band(values, band_idx, use_gpu)
+            band_df = _zonal_stats_single_band(zones, band_values, requested, use_gpu)
+            band_dfs.append(band_df)
+
+        # Merge all band DataFrames on "zone" column with prefixed stat names
+        result = band_dfs[0][["zone"]].copy()
+        for band_idx, band_df in enumerate(band_dfs):
+            band_num = band_idx + 1  # 1-indexed band names
+            stat_cols = [c for c in band_df.columns if c != "zone"]
+            renamed = {col: f"band_{band_num}_{col}" for col in stat_cols}
+            prefixed = band_df.rename(columns=renamed)
+            result = result.merge(prefixed, on="zone", how="outer")
+
     elapsed = time.perf_counter() - t0
 
     n_zones = len(result)
     n_pixels = zones.pixel_count
     backend = "gpu" if use_gpu else "cpu"
+    bands_detail = f" bands={n_bands}" if n_bands > 1 else ""
     zones.diagnostics.append(
         RasterDiagnosticEvent(
             kind=RasterDiagnosticKind.RUNTIME,
             detail=(
-                f"zonal_stats {backend} zones={n_zones} pixels={n_pixels} "
+                f"zonal_stats {backend} zones={n_zones} pixels={n_pixels}"
+                f"{bands_detail} "
                 f"stats={[s.value for s in requested]} elapsed={elapsed:.3f}s"
             ),
             residency=zones.residency,

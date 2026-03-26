@@ -128,14 +128,22 @@ class TestZonalStatsEdgeCases:
         with pytest.raises(ValueError, match="zones raster must be single-band"):
             zonal_stats(zones, values)
 
-    def test_zonal_multiband_values_raises(self):
-        """Multiband values raster must be rejected with ValueError."""
-        zones_data = np.ones((4, 4), dtype=np.int32)
-        values_data = np.ones((3, 4, 4), dtype=np.float64)  # 3-band
+    def test_zonal_multiband_values_accepted(self):
+        """Multiband values raster is accepted and produces per-band columns."""
+        zones_data = np.array([[1, 1, 2], [2, 2, 1]], dtype=np.int32)
+        values_data = np.stack(
+            [
+                np.array([[10.0, 20.0, 30.0], [40.0, 50.0, 60.0]]),
+                np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]),
+            ]
+        )  # 2-band
         zones = from_numpy(zones_data)
         values = from_numpy(values_data)
-        with pytest.raises(ValueError, match="values raster must be single-band"):
-            zonal_stats(zones, values)
+        result = zonal_stats(zones, values, stats=["mean"])
+        # Should have band-prefixed columns, not bare "mean"
+        assert "band_1_mean" in result.columns
+        assert "band_2_mean" in result.columns
+        assert "mean" not in result.columns
 
     def test_zonal_spec(self):
         zones = from_numpy(np.array([[1, 2]], dtype=np.int32))
@@ -145,6 +153,138 @@ class TestZonalStatsEdgeCases:
         assert "min" in result.columns
         assert "max" in result.columns
         assert "sum" not in result.columns
+
+
+class TestZonalStatsMultiband:
+    """Per-band dispatch for multiband values rasters."""
+
+    def test_zonal_multiband_values(self):
+        """3-band values raster produces band_N_ prefixed columns for each stat."""
+        rng = np.random.default_rng(42)
+        zones_data = np.array([[1, 1, 2, 2], [1, 2, 2, 3], [3, 3, 3, 3]], dtype=np.int32)
+        band_1 = rng.random((3, 4)) * 100
+        band_2 = rng.random((3, 4)) * 200
+        band_3 = rng.random((3, 4)) * 50
+        values_data = np.stack([band_1, band_2, band_3])  # shape (3, 3, 4)
+
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+
+        result = zonal_stats(zones, values, stats=["mean", "std"], use_gpu=False)
+
+        # Verify column structure: zone + band_N_stat for each of 3 bands x 2 stats
+        assert "zone" in result.columns
+        for band_num in (1, 2, 3):
+            for stat in ("mean", "std"):
+                col = f"band_{band_num}_{stat}"
+                assert col in result.columns, f"Missing column: {col}"
+
+        # No bare stat columns
+        assert "mean" not in result.columns
+        assert "std" not in result.columns
+
+        # All 3 zones present
+        assert set(result["zone"].values) == {1, 2, 3}
+
+    def test_zonal_multiband_zones_still_raises(self):
+        """Multiband zones raster still raises ValueError."""
+        zones_data = np.ones((2, 4, 4), dtype=np.int32)
+        values_data = np.ones((4, 4), dtype=np.float64)
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+        with pytest.raises(ValueError, match="zones raster must be single-band"):
+            zonal_stats(zones, values)
+
+    def test_zonal_multiband_matches_individual(self):
+        """Per-band multiband results match running zonal_stats on each band individually."""
+        rng = np.random.default_rng(99)
+        zones_data = np.array([[1, 1, 2], [2, 3, 3]], dtype=np.int32)
+        band_1 = rng.random((2, 3)) * 100
+        band_2 = rng.random((2, 3)) * 50
+        band_3 = rng.random((2, 3)) * 200
+        values_data = np.stack([band_1, band_2, band_3])
+
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+
+        all_stats = ["count", "sum", "mean", "min", "max", "std", "median"]
+
+        # Multiband call
+        result_multi = zonal_stats(zones, values, stats=all_stats, use_gpu=False)
+
+        # Individual per-band calls
+        for band_idx, band_data in enumerate([band_1, band_2, band_3]):
+            band_num = band_idx + 1
+            single_values = from_numpy(band_data)
+            single_zones = from_numpy(zones_data)
+            result_single = zonal_stats(single_zones, single_values, stats=all_stats, use_gpu=False)
+
+            # Sort both by zone for comparison
+            result_single_sorted = result_single.sort_values("zone").reset_index(drop=True)
+            result_multi_sorted = result_multi.sort_values("zone").reset_index(drop=True)
+
+            for stat in all_stats:
+                single_col = result_single_sorted[stat].values
+                multi_col = result_multi_sorted[f"band_{band_num}_{stat}"].values
+                np.testing.assert_allclose(
+                    single_col,
+                    multi_col,
+                    rtol=1e-12,
+                    atol=1e-12,
+                    err_msg=f"Mismatch for band_{band_num}_{stat}",
+                )
+
+    def test_zonal_single_band_no_prefix(self):
+        """Single-band values still produce unprefixed columns (backward compat)."""
+        zones = from_numpy(np.array([[1, 2]], dtype=np.int32))
+        values = from_numpy(np.array([[5.0, 10.0]]))
+        result = zonal_stats(zones, values, stats=["mean", "sum"])
+        assert "mean" in result.columns
+        assert "sum" in result.columns
+        assert "band_1_mean" not in result.columns
+
+    def test_zonal_multiband_nodata_propagation(self):
+        """Nodata in multiband values is correctly excluded per-band."""
+        zones_data = np.array([[1, 1, 2, 2]], dtype=np.int32)
+        band_1 = np.array([[10.0, -9999.0, 30.0, 40.0]])
+        band_2 = np.array([[1.0, 2.0, -9999.0, 4.0]])
+        values_data = np.stack([band_1, band_2])
+
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data, nodata=-9999.0)
+
+        result = zonal_stats(zones, values, stats=["count", "sum"], use_gpu=False)
+        result_sorted = result.sort_values("zone").reset_index(drop=True)
+
+        # Band 1, zone 1: only pixel 10.0 (the -9999 is nodata)
+        assert result_sorted.loc[0, "band_1_count"] == 1
+        assert result_sorted.loc[0, "band_1_sum"] == pytest.approx(10.0)
+        # Band 1, zone 2: pixels 30.0, 40.0
+        assert result_sorted.loc[1, "band_1_count"] == 2
+        assert result_sorted.loc[1, "band_1_sum"] == pytest.approx(70.0)
+
+        # Band 2, zone 1: pixels 1.0, 2.0
+        assert result_sorted.loc[0, "band_2_count"] == 2
+        assert result_sorted.loc[0, "band_2_sum"] == pytest.approx(3.0)
+        # Band 2, zone 2: only pixel 4.0 (the -9999 is nodata)
+        assert result_sorted.loc[1, "band_2_count"] == 1
+        assert result_sorted.loc[1, "band_2_sum"] == pytest.approx(4.0)
+
+    def test_zonal_multiband_diagnostics(self):
+        """Multiband zonal_stats appends diagnostic event with band count."""
+        zones_data = np.array([[1, 2]], dtype=np.int32)
+        values_data = np.stack(
+            [
+                np.array([[5.0, 10.0]]),
+                np.array([[15.0, 20.0]]),
+            ]
+        )
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+        zonal_stats(zones, values, stats=["mean"], use_gpu=False)
+        runtime_events = [e for e in zones.diagnostics if e.kind == "runtime"]
+        assert len(runtime_events) > 0
+        assert "bands=2" in runtime_events[-1].detail
 
 
 class TestZonalStatsDispatch:
