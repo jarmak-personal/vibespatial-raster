@@ -119,6 +119,24 @@ class TestZonalStatsEdgeCases:
         result = zonal_stats(zones, values)
         assert len(result) == 0
 
+    def test_zonal_multiband_zones_raises(self):
+        """Multiband zones raster must be rejected with ValueError."""
+        zones_data = np.ones((2, 4, 4), dtype=np.int32)  # 2-band
+        values_data = np.ones((4, 4), dtype=np.float64)
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+        with pytest.raises(ValueError, match="zones raster must be single-band"):
+            zonal_stats(zones, values)
+
+    def test_zonal_multiband_values_raises(self):
+        """Multiband values raster must be rejected with ValueError."""
+        zones_data = np.ones((4, 4), dtype=np.int32)
+        values_data = np.ones((3, 4, 4), dtype=np.float64)  # 3-band
+        zones = from_numpy(zones_data)
+        values = from_numpy(values_data)
+        with pytest.raises(ValueError, match="values raster must be single-band"):
+            zonal_stats(zones, values)
+
     def test_zonal_spec(self):
         zones = from_numpy(np.array([[1, 2]], dtype=np.int32))
         values = from_numpy(np.array([[5.0, 10.0]]))

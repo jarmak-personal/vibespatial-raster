@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-24T13:50:07Z",
-  "staged_hash": "d15b0206cdd7c3f6891c476f11b03ef0d91617d6da17852c28920d86f92f1359",
-  "files": [".claude/.review-completed","BUG_SWEEP.md","src/vibespatial/raster/algebra.py","src/vibespatial/raster/distance.py","src/vibespatial/raster/histogram.py","src/vibespatial/raster/hydrology.py","src/vibespatial/raster/label.py","src/vibespatial/raster/rasterize.py","src/vibespatial/raster/resample.py","tests/test_raster_distance.py","tests/test_raster_expression.py","tests/test_raster_hillshade.py","tests/test_raster_histogram.py","tests/test_raster_rasterize.py","tests/test_raster_zonal.py","tests/test_terrain_derivatives.py"],
+  "timestamp": "2026-03-26T17:41:43Z",
+  "staged_hash": "9fb41ff3934d8ce0291c23ef774331e8a2b6b340f0bed94e7df2c06d1c1af092",
+  "files": ["src/vibespatial/raster/zonal.py","tests/test_raster_zonal.py"],
   "verdict": "LAND"
 }

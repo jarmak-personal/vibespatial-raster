@@ -472,6 +472,13 @@ def zonal_stats(
     pd.DataFrame
         One row per zone, columns for zone label and each requested statistic.
     """
+    if zones.band_count != 1:
+        raise ValueError("zones raster must be single-band")
+    if values.band_count != 1:
+        raise ValueError(
+            "values raster must be single-band. For multiband, select a band first via indexing."
+        )
+
     if zones.height != values.height or zones.width != values.width:
         raise ValueError(
             f"zones shape ({zones.height}x{zones.width}) must match "
