@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import collections
 import time
+import warnings
 
 import numpy as np
 from shapely.geometry import Polygon, shape
@@ -29,6 +30,59 @@ from vibespatial.raster.buffers import (
 from vibespatial.residency import Residency, TransferTrigger
 
 # ---------------------------------------------------------------------------
+# Band selection helper
+# ---------------------------------------------------------------------------
+
+_BAND_SENTINEL = object()  # sentinel to distinguish default from explicit band=1
+
+
+def _select_band(data: np.ndarray, band: int | object, *, caller: str) -> np.ndarray:
+    """Select a single band from multiband data.
+
+    Parameters
+    ----------
+    data : numpy array of shape (H, W) or (B, H, W)
+    band : 1-indexed band number, or ``_BAND_SENTINEL`` for default behavior
+    caller : name of the calling function (for warning messages)
+
+    Returns
+    -------
+    2-D numpy array (H, W)
+
+    Raises
+    ------
+    IndexError
+        If the band number is out of range for the raster.
+    """
+    if data.ndim == 2:
+        return data
+
+    n_bands = data.shape[0]
+
+    # Resolve the band index
+    if band is _BAND_SENTINEL:
+        # Default: use band 1, but warn the user that multiband input is
+        # being silently reduced.
+        warnings.warn(
+            "Multiband raster received, using band 1. Pass band=N to select a specific band.",
+            UserWarning,
+            stacklevel=3,
+        )
+        band_idx = 0
+    else:
+        band_idx = int(band) - 1  # 1-indexed → 0-indexed
+
+    if band_idx < 0 or band_idx >= n_bands:
+        raise IndexError(
+            f"Band {band_idx + 1} is out of range for raster with "
+            f"{n_bands} band{'s' if n_bands != 1 else ''} "
+            f"(valid range: 1..{n_bands})"
+        )
+
+    return data[band_idx]
+
+
+# ---------------------------------------------------------------------------
 # CPU baseline via rasterio.features.shapes
 # ---------------------------------------------------------------------------
 
@@ -37,8 +91,19 @@ def polygonize_cpu(
     raster: OwnedRasterArray,
     *,
     spec: PolygonizeSpec | None = None,
+    band: int | object = _BAND_SENTINEL,
 ) -> tuple[list, list]:
     """Polygonize a raster using rasterio (CPU baseline).
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster to polygonize.
+    spec : PolygonizeSpec or None
+        Optional polygonize configuration.
+    band : int
+        1-indexed band to polygonize. Defaults to band 1 with a warning
+        when multiband input is received.
 
     Returns (geometries, values) lists.
     """
@@ -55,8 +120,7 @@ def polygonize_cpu(
         spec = PolygonizeSpec()
 
     data = raster.to_numpy()
-    if data.ndim == 3:
-        data = data[0]
+    data = _select_band(data, band, caller="polygonize_cpu")
 
     transform = Affine(
         raster.affine[0],
@@ -319,8 +383,19 @@ def polygonize_gpu(
     raster: OwnedRasterArray,
     *,
     spec: PolygonizeSpec | None = None,
+    band: int | object = _BAND_SENTINEL,
 ) -> tuple[list, list]:
     """Polygonize a raster using GPU marching-squares kernels.
+
+    Parameters
+    ----------
+    raster : OwnedRasterArray
+        Input raster to polygonize.
+    spec : PolygonizeSpec or None
+        Optional polygonize configuration.
+    band : int
+        1-indexed band to polygonize. Defaults to band 1 with a warning
+        when multiband input is received.
 
     Pipeline (per unique raster value):
       1. Transfer raster to device (once, shared across all values)
@@ -378,7 +453,23 @@ def polygonize_gpu(
     )
     d_data = raster.device_data()
     if d_data.ndim == 3:
-        d_data = d_data[0]
+        n_bands = d_data.shape[0]
+        if band is _BAND_SENTINEL:
+            warnings.warn(
+                "Multiband raster received, using band 1. Pass band=N to select a specific band.",
+                UserWarning,
+                stacklevel=2,
+            )
+            band_idx = 0
+        else:
+            band_idx = int(band) - 1
+        if band_idx < 0 or band_idx >= n_bands:
+            raise IndexError(
+                f"Band {band_idx + 1} is out of range for raster with "
+                f"{n_bands} band{'s' if n_bands != 1 else ''} "
+                f"(valid range: 1..{n_bands})"
+            )
+        d_data = d_data[band_idx]
 
     orig_height, orig_width = d_data.shape
 
@@ -787,6 +878,7 @@ def polygonize_owned(
     max_polygons: int | None = 1_000_000,
     value_field: str = "value",
     use_gpu: bool | None = None,
+    band: int | object = _BAND_SENTINEL,
 ) -> tuple[list, list]:
     """Polygonize a raster into geometries and values.
 
@@ -804,6 +896,9 @@ def polygonize_owned(
         Name for the value attribute.
     use_gpu : bool or None
         Force GPU (True), force CPU (False), or auto-dispatch (None).
+    band : int
+        1-indexed band to polygonize (rasterio convention). Defaults to
+        band 1 with a warning when multiband input is received.
 
     Returns
     -------
@@ -822,9 +917,9 @@ def polygonize_owned(
 
     t0 = time.perf_counter()
     if use_gpu:
-        geometries, values = polygonize_gpu(raster, spec=spec)
+        geometries, values = polygonize_gpu(raster, spec=spec, band=band)
     else:
-        geometries, values = polygonize_cpu(raster, spec=spec)
+        geometries, values = polygonize_cpu(raster, spec=spec, band=band)
     elapsed = time.perf_counter() - t0
 
     raster.diagnostics.append(
@@ -849,6 +944,7 @@ def polygonize_to_gdf(
     simplify_tolerance: float | None = None,
     max_polygons: int | None = 1_000_000,
     value_field: str = "value",
+    band: int | object = _BAND_SENTINEL,
 ):
     """Polygonize a raster into a GeoDataFrame.
 
@@ -858,6 +954,9 @@ def polygonize_to_gdf(
         Input raster.
     connectivity, simplify_tolerance, max_polygons, value_field
         See polygonize_owned.
+    band : int
+        1-indexed band to polygonize (rasterio convention). Defaults to
+        band 1 with a warning when multiband input is received.
 
     Returns
     -------
@@ -872,6 +971,7 @@ def polygonize_to_gdf(
         simplify_tolerance=simplify_tolerance,
         max_polygons=max_polygons,
         value_field=value_field,
+        band=band,
     )
 
     return gpd.GeoDataFrame(

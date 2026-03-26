@@ -6,6 +6,8 @@ and GPU marching-squares tests.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -237,6 +239,99 @@ class TestRegressionCorpus:
         geoms, vals = polygonize_owned(raster, connectivity=4)
         assert 1.0 in vals
         assert 2.0 in vals
+
+
+# ---------------------------------------------------------------------------
+# Band selection tests (vibeSpatial-2to.1.3)
+# ---------------------------------------------------------------------------
+
+
+class TestPolygonizeMultibandBandSelection:
+    """Tests for the ``band`` parameter on multiband rasters."""
+
+    @staticmethod
+    def _make_multiband_raster():
+        """Create a 3-band raster where each band has a distinct value pattern.
+
+        Band 1 (idx 0): all 10s
+        Band 2 (idx 1): all 20s
+        Band 3 (idx 2): all 30s
+        """
+        data = np.stack(
+            [
+                np.full((4, 4), 10.0, dtype=np.float32),
+                np.full((4, 4), 20.0, dtype=np.float32),
+                np.full((4, 4), 30.0, dtype=np.float32),
+            ],
+            axis=0,
+        )
+        assert data.shape == (3, 4, 4)
+        return from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+
+    def test_polygonize_multiband_default_band(self):
+        """Default band should be 1 and a UserWarning should be emitted."""
+        raster = self._make_multiband_raster()
+
+        with pytest.warns(
+            UserWarning,
+            match="Multiband raster received, using band 1",
+        ):
+            geoms, vals = polygonize_cpu(raster)
+
+        # Band 1 contains value 10.0
+        assert len(geoms) >= 1
+        assert all(v == 10.0 for v in vals)
+
+    def test_polygonize_multiband_explicit_band(self):
+        """Explicit band=2 should select the second band (value 20.0)."""
+        raster = self._make_multiband_raster()
+
+        # No warning should be emitted when band is explicitly provided
+        geoms, vals = polygonize_cpu(raster, band=2)
+
+        assert len(geoms) >= 1
+        assert all(v == 20.0 for v in vals)
+
+    def test_polygonize_multiband_band3(self):
+        """Explicit band=3 should select the third band (value 30.0)."""
+        raster = self._make_multiband_raster()
+        geoms, vals = polygonize_cpu(raster, band=3)
+
+        assert len(geoms) >= 1
+        assert all(v == 30.0 for v in vals)
+
+    def test_polygonize_multiband_invalid_band_raises(self):
+        """Out-of-range band should raise IndexError."""
+        raster = self._make_multiband_raster()
+
+        with pytest.raises(IndexError, match="Band 4 is out of range"):
+            polygonize_cpu(raster, band=4)
+
+        with pytest.raises(IndexError, match="Band 0 is out of range"):
+            polygonize_cpu(raster, band=0)
+
+        with pytest.raises(IndexError, match="Band -1 is out of range"):
+            polygonize_cpu(raster, band=-1)
+
+    def test_polygonize_owned_band_forwarding(self):
+        """polygonize_owned should forward the band parameter."""
+        raster = self._make_multiband_raster()
+
+        # Explicit band=2 via the public entry point
+        geoms, vals = polygonize_owned(raster, band=2, use_gpu=False)
+        assert len(geoms) >= 1
+        assert all(v == 20.0 for v in vals)
+
+    def test_polygonize_singleband_no_warning(self):
+        """Single-band raster should not trigger a band warning."""
+        data = np.full((4, 4), 5.0, dtype=np.float32)
+        raster = from_numpy(data, affine=(1.0, 0.0, 0.0, 0.0, -1.0, 4.0))
+
+        # No warning expected for 2-D (single-band) input
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            geoms, vals = polygonize_cpu(raster)
+        assert len(geoms) >= 1
 
 
 # ---------------------------------------------------------------------------
