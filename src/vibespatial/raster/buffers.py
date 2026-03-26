@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -463,6 +464,155 @@ class OwnedRasterArray:
             mask = state.data == self.nodata
         self.device_state = RasterDeviceState(data=state.data, nodata_mask=mask)
         return mask
+
+    # -- Band slicing --
+
+    def device_band(self, band_index: int) -> object:
+        """Return a 2D CuPy view of a single band (zero-copy slice).
+
+        Parameters
+        ----------
+        band_index : int
+            0-indexed band index.
+
+        Returns
+        -------
+        object
+            CuPy ndarray of shape ``(height, width)`` -- a view into the
+            device array, not a copy.
+
+        Raises
+        ------
+        IndexError
+            If *band_index* is out of range for the raster's band count.
+        """
+        d = self.device_data()
+        if d.ndim == 2:
+            if band_index != 0:
+                raise IndexError(f"single-band raster, got band_index={band_index}")
+            return d
+        if band_index < 0 or band_index >= d.shape[0]:
+            raise IndexError(f"band_index={band_index} out of range for {d.shape[0]}-band raster")
+        return d[band_index]
+
+    # -- Band assembly --
+
+    @staticmethod
+    def from_band_stack(
+        band_results: Sequence[OwnedRasterArray],
+        *,
+        source: OwnedRasterArray,
+    ) -> OwnedRasterArray:
+        """Assemble a multiband OwnedRasterArray from per-band results.
+
+        Parameters
+        ----------
+        band_results : Sequence[OwnedRasterArray]
+            One single-band OwnedRasterArray per band, in order.
+        source : OwnedRasterArray
+            Original raster whose affine, CRS, and nodata are propagated
+            to the assembled result.
+
+        Returns
+        -------
+        OwnedRasterArray
+            A new raster with shape ``(len(band_results), H, W)`` (or
+            ``(H, W)`` when a single result is passed through unchanged).
+
+        Raises
+        ------
+        ValueError
+            If *band_results* is empty, if dtypes mismatch across bands,
+            if nodata values mismatch, or if spatial dimensions differ.
+        """
+        if not band_results:
+            raise ValueError("band_results must not be empty")
+
+        # --- Single-band passthrough (zero overhead) ---
+        if len(band_results) == 1:
+            result = band_results[0]
+            # Propagate source metadata that the caller expects
+            result.affine = source.affine
+            result.crs = source.crs
+            result.nodata = source.nodata
+            return result
+
+        # --- Validate consistency across bands ---
+        ref_dtype = band_results[0].dtype
+        ref_nodata = band_results[0].nodata
+        ref_h = band_results[0].height
+        ref_w = band_results[0].width
+
+        for i, br in enumerate(band_results[1:], start=1):
+            if br.dtype != ref_dtype:
+                raise ValueError(f"dtype mismatch: band 0 has {ref_dtype}, band {i} has {br.dtype}")
+            # Compare nodata: both None, both NaN, or equal
+            if ref_nodata is None and br.nodata is not None:
+                raise ValueError(f"nodata mismatch: band 0 has None, band {i} has {br.nodata}")
+            if ref_nodata is not None and br.nodata is None:
+                raise ValueError(f"nodata mismatch: band 0 has {ref_nodata}, band {i} has None")
+            if ref_nodata is not None and br.nodata is not None:
+                both_nan = (
+                    isinstance(ref_nodata, float)
+                    and isinstance(br.nodata, float)
+                    and np.isnan(ref_nodata)
+                    and np.isnan(br.nodata)
+                )
+                if not both_nan and ref_nodata != br.nodata:
+                    raise ValueError(
+                        f"nodata mismatch: band 0 has {ref_nodata}, band {i} has {br.nodata}"
+                    )
+            if br.height != ref_h or br.width != ref_w:
+                raise ValueError(
+                    f"shape mismatch: band 0 is ({ref_h}, {ref_w}), "
+                    f"band {i} is ({br.height}, {br.width})"
+                )
+
+        # --- Determine residency: device if any band is on device ---
+        any_on_device = any(br.residency is Residency.DEVICE for br in band_results)
+
+        # --- Merge diagnostics from all bands ---
+        merged_diagnostics: list[RasterDiagnosticEvent] = []
+        for br in band_results:
+            merged_diagnostics.extend(br.diagnostics)
+
+        if any_on_device:
+            import cupy as cp
+
+            band_arrays = []
+            for br in band_results:
+                d = br.device_data()
+                # Ensure each result is 2D for stacking
+                if d.ndim == 3 and d.shape[0] == 1:
+                    d = d[0]
+                band_arrays.append(d)
+            stacked = cp.stack(band_arrays, axis=0)
+
+            result = from_device(
+                stacked,
+                nodata=source.nodata,
+                affine=source.affine,
+                crs=source.crs,
+            )
+        else:
+            band_arrays_np = []
+            for br in band_results:
+                h = br.to_numpy()
+                if h.ndim == 3 and h.shape[0] == 1:
+                    h = h[0]
+                band_arrays_np.append(h)
+            stacked_np = np.stack(band_arrays_np, axis=0)
+
+            result = from_numpy(
+                stacked_np,
+                nodata=source.nodata,
+                affine=source.affine,
+                crs=source.crs,
+            )
+
+        # Prepend merged diagnostics (before the factory's CREATED event)
+        result.diagnostics = merged_diagnostics + result.diagnostics
+        return result
 
     # -- Diagnostics --
 

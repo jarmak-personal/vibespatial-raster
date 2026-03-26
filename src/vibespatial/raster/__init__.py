@@ -108,6 +108,9 @@ __all__ = [
     "raster_percentile",
     # Hydrology
     "raster_fill_sinks",
+    # Dispatch / VRAM budget
+    "available_vram_bytes",
+    "max_bands_for_budget",
     # NVRTC cache management (from vibespatial.cuda_runtime)
     "clear_nvrtc_cache",
     "nvrtc_cache_stats",
@@ -214,6 +217,11 @@ def __getattr__(name):
         from vibespatial.raster import hydrology
 
         return getattr(hydrology, name)
+    # Dispatch / VRAM budget
+    if name in ("available_vram_bytes", "max_bands_for_budget"):
+        from vibespatial.raster import dispatch
+
+        return getattr(dispatch, name)
     # NVRTC cache management
     if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
         from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats

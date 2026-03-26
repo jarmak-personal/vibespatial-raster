@@ -640,3 +640,293 @@ class TestFromDevice:
         assert event.kind == RasterDiagnosticKind.CREATED
         assert "from_device" in event.detail
         assert event.residency is Residency.DEVICE
+
+
+# ---------------------------------------------------------------------------
+# device_band
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceBand:
+    """Tests for OwnedRasterArray.device_band() zero-copy band slicing."""
+
+    @requires_gpu
+    def test_device_band_single_band(self):
+        """Index 0 returns the 2D array; index 1 raises IndexError."""
+        import cupy as cp
+
+        data = np.arange(12, dtype=np.float32).reshape(3, 4)
+        raster = from_numpy(data)
+
+        band0 = raster.device_band(0)
+        assert band0.shape == (3, 4)
+        np.testing.assert_array_equal(cp.asnumpy(band0), data)
+
+        with pytest.raises(IndexError, match="single-band raster"):
+            raster.device_band(1)
+
+    @requires_gpu
+    def test_device_band_multiband(self):
+        """Each band returns a correct (H, W) view from a (B, H, W) raster."""
+        import cupy as cp
+
+        rng = np.random.default_rng(42)
+        data = rng.random((3, 10, 20), dtype=np.float64)
+        raster = from_numpy(data)
+
+        for b in range(3):
+            band = raster.device_band(b)
+            assert band.shape == (10, 20)
+            np.testing.assert_array_equal(cp.asnumpy(band), data[b])
+
+    @requires_gpu
+    def test_device_band_out_of_range_raises(self):
+        """Negative and too-large indices raise IndexError."""
+        data = np.zeros((3, 4, 5), dtype=np.float32)
+        raster = from_numpy(data)
+
+        with pytest.raises(IndexError, match="out of range"):
+            raster.device_band(3)
+
+        with pytest.raises(IndexError, match="out of range"):
+            raster.device_band(-1)
+
+    @requires_gpu
+    def test_device_band_is_zero_copy(self):
+        """The returned band view shares memory with the full device array."""
+        data = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+        raster = from_numpy(data)
+
+        full = raster.device_data()
+        band0 = raster.device_band(0)
+        band1 = raster.device_band(1)
+
+        # Views share the same base memory (CuPy .base or .data.ptr check)
+        assert band0.data.ptr == full.data.ptr
+        assert band1.data.ptr == full[1].data.ptr
+
+
+# ---------------------------------------------------------------------------
+# device_band -- CPU-only tests (no GPU required)
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceBandCPUOnly:
+    """Tests for device_band that work without a GPU by mocking device_data."""
+
+    def test_device_band_single_band_index_0(self):
+        """Index 0 on a 2D mock returns the array unchanged."""
+        data = np.arange(12, dtype=np.float32).reshape(3, 4)
+        raster = from_numpy(data)
+
+        # Mock device_data to return a numpy array (standing in for CuPy)
+        raster.device_data = lambda: data
+
+        result = raster.device_band(0)
+        assert result is data
+
+    def test_device_band_single_band_index_1_raises(self):
+        """Index 1 on a single-band raster raises IndexError."""
+        data = np.arange(12, dtype=np.float32).reshape(3, 4)
+        raster = from_numpy(data)
+        raster.device_data = lambda: data
+
+        with pytest.raises(IndexError, match="single-band raster"):
+            raster.device_band(1)
+
+    def test_device_band_multiband_returns_correct_shape(self):
+        """Multi-band raster returns (H, W) slices."""
+        data = np.arange(60, dtype=np.float32).reshape(3, 4, 5)
+        raster = from_numpy(data)
+        raster.device_data = lambda: data
+
+        for b in range(3):
+            band = raster.device_band(b)
+            assert band.shape == (4, 5)
+            np.testing.assert_array_equal(band, data[b])
+
+    def test_device_band_multiband_out_of_range(self):
+        """Out-of-range indices on multi-band raster raise IndexError."""
+        data = np.zeros((2, 3, 4), dtype=np.float32)
+        raster = from_numpy(data)
+        raster.device_data = lambda: data
+
+        with pytest.raises(IndexError, match="out of range"):
+            raster.device_band(2)
+
+        with pytest.raises(IndexError, match="out of range"):
+            raster.device_band(-1)
+
+
+# ---------------------------------------------------------------------------
+# from_band_stack
+# ---------------------------------------------------------------------------
+
+
+class TestFromBandStack:
+    """Tests for OwnedRasterArray.from_band_stack() band assembly."""
+
+    def _make_source(
+        self,
+        *,
+        height: int = 10,
+        width: int = 20,
+        bands: int = 3,
+        dtype=np.float32,
+        nodata: float | int | None = -9999.0,
+    ) -> OwnedRasterArray:
+        """Create a source raster with known metadata."""
+        shape = (bands, height, width) if bands > 1 else (height, width)
+        data = np.zeros(shape, dtype=dtype)
+        return from_numpy(
+            data,
+            nodata=nodata,
+            affine=(0.5, 0.0, 10.0, 0.0, -0.5, 60.0),
+        )
+
+    def _make_band_result(
+        self,
+        *,
+        height: int = 10,
+        width: int = 20,
+        dtype=np.float32,
+        nodata: float | int | None = -9999.0,
+        fill: float = 1.0,
+    ) -> OwnedRasterArray:
+        """Create a single-band result raster."""
+        data = np.full((height, width), fill, dtype=dtype)
+        return from_numpy(data, nodata=nodata)
+
+    def test_from_band_stack_basic(self):
+        """3 single-band results assemble into a (3, H, W) raster."""
+        source = self._make_source()
+        bands = [self._make_band_result(fill=float(i + 1)) for i in range(3)]
+
+        result = OwnedRasterArray.from_band_stack(bands, source=source)
+
+        assert result.band_count == 3
+        assert result.height == 10
+        assert result.width == 20
+        assert result.dtype == np.float32
+        assert result.nodata == source.nodata
+        assert result.affine == source.affine
+        assert result.crs == source.crs
+        assert result.shape == (3, 10, 20)
+
+        out = result.to_numpy()
+        np.testing.assert_array_equal(out[0], np.full((10, 20), 1.0, dtype=np.float32))
+        np.testing.assert_array_equal(out[1], np.full((10, 20), 2.0, dtype=np.float32))
+        np.testing.assert_array_equal(out[2], np.full((10, 20), 3.0, dtype=np.float32))
+
+    def test_from_band_stack_dtype_mismatch_raises(self):
+        """Mixed float32/float64 raises ValueError."""
+        source = self._make_source()
+        band_f32 = self._make_band_result(dtype=np.float32)
+        band_f64 = self._make_band_result(dtype=np.float64)
+
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            OwnedRasterArray.from_band_stack([band_f32, band_f64], source=source)
+
+    def test_from_band_stack_nodata_mismatch_raises(self):
+        """Different nodata values raise ValueError."""
+        source = self._make_source()
+        band_a = self._make_band_result(nodata=-9999.0)
+        band_b = self._make_band_result(nodata=-1.0)
+
+        with pytest.raises(ValueError, match="nodata mismatch"):
+            OwnedRasterArray.from_band_stack([band_a, band_b], source=source)
+
+    def test_from_band_stack_nodata_none_vs_value_raises(self):
+        """None nodata vs non-None nodata raises ValueError."""
+        source = self._make_source()
+        band_none = self._make_band_result(nodata=None)
+        band_val = self._make_band_result(nodata=-9999.0)
+
+        with pytest.raises(ValueError, match="nodata mismatch"):
+            OwnedRasterArray.from_band_stack([band_none, band_val], source=source)
+
+        with pytest.raises(ValueError, match="nodata mismatch"):
+            OwnedRasterArray.from_band_stack([band_val, band_none], source=source)
+
+    def test_from_band_stack_shape_mismatch_raises(self):
+        """Different spatial dimensions raise ValueError."""
+        source = self._make_source()
+        band_a = self._make_band_result(height=10, width=20)
+        band_b = self._make_band_result(height=10, width=30)
+
+        with pytest.raises(ValueError, match="shape mismatch"):
+            OwnedRasterArray.from_band_stack([band_a, band_b], source=source)
+
+    def test_from_band_stack_single_band_passthrough(self):
+        """Single result is returned without stacking (zero overhead)."""
+        source = self._make_source()
+        band = self._make_band_result(fill=42.0)
+
+        result = OwnedRasterArray.from_band_stack([band], source=source)
+
+        # Should be the same object, not a copy
+        assert result is band
+        # Metadata propagated from source
+        assert result.affine == source.affine
+        assert result.crs == source.crs
+        assert result.nodata == source.nodata
+        # Still single-band
+        assert result.band_count == 1
+        assert result.shape == (10, 20)
+
+    def test_from_band_stack_empty_raises(self):
+        """Empty band_results raises ValueError."""
+        source = self._make_source()
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            OwnedRasterArray.from_band_stack([], source=source)
+
+    def test_from_band_stack_preserves_dtype(self):
+        """Output dtype matches input band dtype."""
+        source = self._make_source(dtype=np.int16, nodata=-1)
+        bands = [self._make_band_result(dtype=np.int16, nodata=-1, fill=float(i)) for i in range(2)]
+
+        result = OwnedRasterArray.from_band_stack(bands, source=source)
+        assert result.dtype == np.int16
+
+    def test_from_band_stack_merges_diagnostics(self):
+        """Diagnostics from all band results are merged into the output."""
+        source = self._make_source()
+        bands = [self._make_band_result(fill=float(i + 1)) for i in range(3)]
+
+        result = OwnedRasterArray.from_band_stack(bands, source=source)
+
+        # Each band has a CREATED event from from_numpy, plus the result's
+        # own CREATED event from from_numpy
+        created_events = [e for e in result.diagnostics if e.kind == RasterDiagnosticKind.CREATED]
+        # 3 from bands + 1 from the final from_numpy = 4
+        assert len(created_events) == 4
+
+    def test_from_band_stack_nan_nodata_accepted(self):
+        """Two bands with NaN nodata do not raise (NaN == NaN is handled)."""
+        source = self._make_source(nodata=np.nan, dtype=np.float64)
+        band_a = self._make_band_result(dtype=np.float64, nodata=np.nan, fill=1.0)
+        band_b = self._make_band_result(dtype=np.float64, nodata=np.nan, fill=2.0)
+
+        # Should not raise
+        result = OwnedRasterArray.from_band_stack([band_a, band_b], source=source)
+        assert result.band_count == 2
+
+    @requires_gpu
+    def test_from_band_stack_device_resident(self):
+        """Band stacking works when band results are on device."""
+        import cupy as cp
+
+        source = self._make_source()
+        bands = []
+        for i in range(3):
+            d = cp.full((10, 20), float(i + 1), dtype=np.float32)
+            bands.append(from_device(d, nodata=-9999.0))
+
+        result = OwnedRasterArray.from_band_stack(bands, source=source)
+        assert result.band_count == 3
+        assert result.residency is Residency.DEVICE
+
+        out = result.to_numpy()
+        np.testing.assert_array_equal(out[0], np.full((10, 20), 1.0, dtype=np.float32))
+        np.testing.assert_array_equal(out[2], np.full((10, 20), 3.0, dtype=np.float32))
