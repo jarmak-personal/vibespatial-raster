@@ -23,6 +23,7 @@ from vibespatial.raster.buffers import (
     from_device,
     from_numpy,
 )
+from vibespatial.raster.dispatch import dispatch_per_band_cpu, dispatch_per_band_gpu
 from vibespatial.residency import Residency, TransferTrigger
 
 # ---------------------------------------------------------------------------
@@ -732,6 +733,14 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
     convolution, achieving O(1) global memory reads per output pixel regardless
     of kernel size.
     """
+    # Multiband dispatch: process each band independently
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: _gpu_convolve(r, kernel_weights),
+            buffers_per_band=2,
+        )
+
     import cupy as cp
 
     from vibespatial.cuda_runtime import (
@@ -745,8 +754,8 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
 
     # Move to device and cast to float64 for computation
     d_data = _to_device_data(raster).astype(cp.float64, copy=False)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -760,7 +769,11 @@ def _gpu_convolve(raster: OwnedRasterArray, kernel_weights: np.ndarray) -> Owned
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     if raster.nodata is not None:
-        d_nodata = raster.device_nodata_mask().astype(cp.uint8)
+        d_nodata = raster.device_nodata_mask()
+        # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
+        if d_nodata.ndim == 3:
+            d_nodata = d_nodata[0]
+        d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
         nodata_ptr = 0  # nullptr
@@ -926,12 +939,10 @@ def _cpu_slope_aspect(
 
     Returns (slope_host, aspect_host) numpy arrays, either may be None.
     """
-    data = dem.to_numpy()
+    data = dem.to_numpy().astype(np.float64)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
-
-    data = data.astype(np.float64)
     height, width = data.shape
 
     cell_x = abs(dem.affine[0]) if dem.affine[0] != 0 else 1.0
@@ -1036,8 +1047,8 @@ def _gpu_slope_aspect(
 
     # Keep data on device -- no to_numpy() round-trip
     d_data = _to_device_data(dem).astype(cp.float64, copy=False)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1049,7 +1060,11 @@ def _gpu_slope_aspect(
     # Nodata mask on device (no host round-trip)
     nodata_val = float(dem.nodata) if dem.nodata is not None else 0.0
     if dem.nodata is not None:
-        d_nodata = dem.device_nodata_mask().astype(cp.uint8)
+        d_nodata = dem.device_nodata_mask()
+        # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
+        if d_nodata.ndim == 3:
+            d_nodata = d_nodata[0]
+        d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
         nodata_ptr = 0  # nullptr
@@ -1156,6 +1171,19 @@ def raster_slope(
     if use_gpu is None:
         use_gpu = _should_use_gpu(dem)
 
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        if use_gpu:
+            return dispatch_per_band_gpu(
+                dem,
+                lambda r: raster_slope(r, use_gpu=True),
+                buffers_per_band=2,
+            )
+        return dispatch_per_band_cpu(
+            dem,
+            lambda r: raster_slope(r, use_gpu=False),
+        )
+
     orig_dtype = dem.dtype
 
     if use_gpu:
@@ -1219,6 +1247,19 @@ def raster_aspect(
     if use_gpu is None:
         use_gpu = _should_use_gpu(dem)
 
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        if use_gpu:
+            return dispatch_per_band_gpu(
+                dem,
+                lambda r: raster_aspect(r, use_gpu=True),
+                buffers_per_band=2,
+            )
+        return dispatch_per_band_cpu(
+            dem,
+            lambda r: raster_aspect(r, use_gpu=False),
+        )
+
     orig_dtype = dem.dtype
 
     if use_gpu:
@@ -1273,9 +1314,16 @@ def _hillshade_cpu(
     z_factor: float = 1.0,
 ) -> OwnedRasterArray:
     """CPU hillshade using Horn method (numpy)."""
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        return dispatch_per_band_cpu(
+            dem,
+            lambda r: _hillshade_cpu(r, azimuth=azimuth, altitude=altitude, z_factor=z_factor),
+        )
+
     data = dem.to_numpy().astype(np.float64)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
 
     height, width = data.shape
@@ -1355,6 +1403,14 @@ def _hillshade_gpu(
     z_factor: float = 1.0,
 ) -> OwnedRasterArray:
     """GPU hillshade using NVRTC shared-memory 3x3 stencil kernel."""
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        return dispatch_per_band_gpu(
+            dem,
+            lambda r: _hillshade_gpu(r, azimuth=azimuth, altitude=altitude, z_factor=z_factor),
+            buffers_per_band=2,
+        )
+
     import time as _time
 
     import cupy as cp
@@ -1379,8 +1435,8 @@ def _hillshade_gpu(
     # Ensure fp64 for stencil precision (kernel expects double*)
     if d_data.dtype != cp.float64:
         d_data = d_data.astype(cp.float64, copy=False)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1397,6 +1453,7 @@ def _hillshade_gpu(
     nodata_out = np.uint8(0)
     if dem.nodata is not None:
         d_nodata = dem.device_nodata_mask()
+        # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
         if d_nodata.ndim == 3:
             d_nodata = d_nodata[0]
         d_nodata_u8 = d_nodata.astype(cp.uint8)
@@ -1573,6 +1630,14 @@ def _terrain_derivative_gpu(
     deriv_type : int
         0=TRI, 1=TPI, 2=curvature.
     """
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        return dispatch_per_band_gpu(
+            dem,
+            lambda r: _terrain_derivative_gpu(r, deriv_type),
+            buffers_per_band=2,
+        )
+
     import time
 
     import cupy as cp
@@ -1595,8 +1660,8 @@ def _terrain_derivative_gpu(
         reason="terrain derivative requires device-resident data",
     )
     d_data = dem.device_data().astype(cp.float64, copy=False)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1607,7 +1672,11 @@ def _terrain_derivative_gpu(
     # Nodata
     nodata_val = float(dem.nodata) if dem.nodata is not None else -9999.0
     if dem.nodata is not None:
-        d_nodata = dem.device_nodata_mask().astype(cp.uint8)
+        d_nodata = dem.device_nodata_mask()
+        # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
+        if d_nodata.ndim == 3:
+            d_nodata = d_nodata[0]
+        d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
         nodata_ptr = 0  # nullptr
@@ -1875,14 +1944,21 @@ def _focal_stat_cpu(
     raster: OwnedRasterArray, stat_name: str, radius_y: int, radius_x: int
 ) -> OwnedRasterArray:
     """CPU fallback for a single focal statistic."""
+    # Multiband dispatch: process each band independently
+    if raster.band_count > 1:
+        return dispatch_per_band_cpu(
+            raster,
+            lambda r: _focal_stat_cpu(r, stat_name, radius_y, radius_x),
+        )
+
     data = raster.to_numpy()
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
 
     nodata_mask = raster.nodata_mask if raster.nodata is not None else None
     if nodata_mask is not None and nodata_mask.ndim == 3:
-        nodata_mask = nodata_mask[0]  # follows data squeeze above
+        nodata_mask = nodata_mask[0]
     nodata_val = float(raster.nodata) if raster.nodata is not None else 0.0
 
     fn = _CPU_DISPATCH[stat_name]
@@ -1930,6 +2006,14 @@ def _focal_stat_gpu(
     raster: OwnedRasterArray, stat_name: str, radius_y: int, radius_x: int
 ) -> OwnedRasterArray:
     """GPU implementation of focal statistics via NVRTC kernel."""
+    # Multiband dispatch: process each band independently
+    if raster.band_count > 1:
+        return dispatch_per_band_gpu(
+            raster,
+            lambda r: _focal_stat_gpu(r, stat_name, radius_y, radius_x),
+            buffers_per_band=2,
+        )
+
     import cupy as cp
 
     from vibespatial.cuda_runtime import (
@@ -1945,8 +2029,8 @@ def _focal_stat_gpu(
 
     # Move to device, cast to float64 for kernel computation
     d_data = _to_device_data(raster).astype(cp.float64, copy=False)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if d_data.ndim == 3:
-        _warn_multiband_squeeze(d_data)
         d_data = d_data[0]
 
     height, width = d_data.shape
@@ -1957,8 +2041,9 @@ def _focal_stat_gpu(
 
     if raster.nodata is not None:
         d_nodata = raster.device_nodata_mask()
+        # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
         if d_nodata.ndim == 3:
-            d_nodata = d_nodata[0]  # follows data squeeze above
+            d_nodata = d_nodata[0]
         d_nodata = d_nodata.astype(cp.uint8)
         nodata_ptr = d_nodata.data.ptr
     else:
@@ -2043,9 +2128,16 @@ def _terrain_derivative_cpu(
     deriv_type : int
         0=TRI, 1=TPI, 2=curvature.
     """
+    # Multiband dispatch: process each band independently
+    if dem.band_count > 1:
+        return dispatch_per_band_cpu(
+            dem,
+            lambda r: _terrain_derivative_cpu(r, deriv_type),
+        )
+
     data = dem.to_numpy().astype(np.float64)
+    # Normalize (1, H, W) -> (H, W) for single-band stored as 3D
     if data.ndim == 3:
-        _warn_multiband_squeeze(data)
         data = data[0]
 
     height, width = data.shape

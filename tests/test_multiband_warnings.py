@@ -1,7 +1,10 @@
-"""Tests for multiband squeeze warnings (vibeSpatial-2to.1.4).
+"""Tests for multiband handling in algebra operations.
 
-Verify that UserWarning is emitted when multiband rasters are silently
-squeezed to band 0 in algebra, label, and hydrology operations.
+For raster_expression: verifies that UserWarning is still emitted when
+multiband rasters are silently squeezed to band 0.
+
+For focal/terrain/convolve: verifies that per-band dispatch produces
+correct multiband results (vibeSpatial-2to.3.1).
 """
 
 from __future__ import annotations
@@ -64,7 +67,7 @@ def multiband_dem():
 
 
 # ---------------------------------------------------------------------------
-# Algebra: raster_expression
+# Algebra: raster_expression (squeeze+warn remains for expressions)
 # ---------------------------------------------------------------------------
 
 
@@ -86,119 +89,224 @@ def test_expression_multiband_warns_cpu(multiband_raster):
 
 
 # ---------------------------------------------------------------------------
-# Algebra: raster_convolve / raster_gaussian_filter
+# Algebra: raster_convolve per-band dispatch
 # ---------------------------------------------------------------------------
 
 
 @requires_gpu
-def test_convolve_multiband_warns(multiband_raster):
-    """raster_convolve warns on multiband input."""
+def test_convolve_multiband_3band():
+    """raster_convolve processes all 3 bands via per-band GPU dispatch."""
     from vibespatial.raster.algebra import raster_convolve
 
+    rng = np.random.default_rng(42)
+    data = rng.random((3, 8, 8), dtype=np.float64)
+    raster = from_numpy(data, affine=_AFFINE)
+
     kernel = np.ones((3, 3), dtype=np.float64) / 9.0
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_convolve(multiband_raster, kernel)
 
+    # Verify multiband dispatch produces correct per-band results
+    result = raster_convolve(raster, kernel)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
 
-@requires_gpu
-def test_gaussian_filter_multiband_warns(multiband_raster):
-    """raster_gaussian_filter warns on multiband input."""
-    from vibespatial.raster.algebra import raster_gaussian_filter
+    # Each band should match single-band convolution
+    for i in range(3):
+        band_raster = from_numpy(data[i], affine=_AFFINE)
+        band_result = raster_convolve(band_raster, kernel)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband convolve",
+        )
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_gaussian_filter(multiband_raster, sigma=1.0)
+    # Metadata preservation
+    assert result.affine == raster.affine
+    assert result.crs == raster.crs
 
 
 # ---------------------------------------------------------------------------
-# Algebra: slope / aspect
+# Algebra: slope per-band dispatch
 # ---------------------------------------------------------------------------
 
 
-@requires_gpu
-def test_slope_multiband_warns_gpu(multiband_dem):
-    """raster_slope GPU path warns on multiband DEM."""
+def test_slope_multiband():
+    """raster_slope processes all 3 bands via per-band CPU dispatch."""
     from vibespatial.raster.algebra import raster_slope
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_slope(multiband_dem, use_gpu=True)
+    rng = np.random.default_rng(42)
+    data = rng.random((3, 8, 8), dtype=np.float64) * 100
+    raster = from_numpy(data, affine=_AFFINE)
 
+    result = raster_slope(raster, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
 
-def test_slope_multiband_warns_cpu(multiband_dem):
-    """raster_slope CPU path warns on multiband DEM."""
-    from vibespatial.raster.algebra import raster_slope
+    # Verify each band matches the single-band result
+    for i in range(3):
+        band_raster = from_numpy(data[i], affine=_AFFINE)
+        band_result = raster_slope(band_raster, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband slope",
+        )
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_slope(multiband_dem, use_gpu=False)
+    # Metadata preservation
+    assert result.affine == raster.affine
+    assert result.crs == raster.crs
 
 
 # ---------------------------------------------------------------------------
-# Algebra: hillshade
+# Algebra: hillshade per-band dispatch
 # ---------------------------------------------------------------------------
 
 
-@requires_gpu
-def test_hillshade_multiband_warns_gpu(multiband_dem):
-    """raster_hillshade GPU path warns on multiband DEM."""
+def test_hillshade_multiband_cpu(multiband_dem):
+    """raster_hillshade processes all 3 bands via per-band CPU dispatch."""
     from vibespatial.raster.algebra import raster_hillshade
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_hillshade(multiband_dem, use_gpu=True)
+    result = raster_hillshade(multiband_dem, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
 
+    # Verify each band matches single-band result
+    raw = multiband_dem.to_numpy()
+    for i in range(3):
+        band_raster = from_numpy(raw[i], affine=_AFFINE)
+        band_result = raster_hillshade(band_raster, use_gpu=False)
+        np.testing.assert_array_equal(
+            out[i],
+            band_result.to_numpy(),
+            err_msg=f"Band {i} mismatch in multiband hillshade",
+        )
 
-def test_hillshade_multiband_warns_cpu(multiband_dem):
-    """raster_hillshade CPU path warns on multiband DEM."""
-    from vibespatial.raster.algebra import raster_hillshade
-
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_hillshade(multiband_dem, use_gpu=False)
+    assert result.affine == multiband_dem.affine
 
 
 # ---------------------------------------------------------------------------
-# Algebra: TRI / TPI / curvature
+# Algebra: TRI / TPI / curvature per-band dispatch
 # ---------------------------------------------------------------------------
 
 
-@requires_gpu
-def test_tri_multiband_warns_gpu(multiband_dem):
-    """raster_tri GPU path warns on multiband DEM."""
+def test_tri_multiband_cpu(multiband_dem):
+    """raster_tri processes all 3 bands via per-band CPU dispatch."""
     from vibespatial.raster.algebra import raster_tri
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_tri(multiband_dem, use_gpu=True)
+    result = raster_tri(multiband_dem, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
+
+    raw = multiband_dem.to_numpy()
+    for i in range(3):
+        band_raster = from_numpy(raw[i], affine=_AFFINE)
+        band_result = raster_tri(band_raster, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband TRI",
+        )
 
 
-def test_tri_multiband_warns_cpu(multiband_dem):
-    """raster_tri CPU path warns on multiband DEM."""
-    from vibespatial.raster.algebra import raster_tri
+def test_tpi_multiband_cpu(multiband_dem):
+    """raster_tpi processes all 3 bands via per-band CPU dispatch."""
+    from vibespatial.raster.algebra import raster_tpi
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_tri(multiband_dem, use_gpu=False)
+    result = raster_tpi(multiband_dem, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
+
+    raw = multiband_dem.to_numpy()
+    for i in range(3):
+        band_raster = from_numpy(raw[i], affine=_AFFINE)
+        band_result = raster_tpi(band_raster, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband TPI",
+        )
+
+
+def test_curvature_multiband_cpu(multiband_dem):
+    """raster_curvature processes all 3 bands via per-band CPU dispatch."""
+    from vibespatial.raster.algebra import raster_curvature
+
+    result = raster_curvature(multiband_dem, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 8, 8), f"Expected (3, 8, 8), got {out.shape}"
+
+    raw = multiband_dem.to_numpy()
+    for i in range(3):
+        band_raster = from_numpy(raw[i], affine=_AFFINE)
+        band_result = raster_curvature(band_raster, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband curvature",
+        )
 
 
 # ---------------------------------------------------------------------------
-# Algebra: focal statistics
+# Algebra: focal statistics per-band dispatch
 # ---------------------------------------------------------------------------
 
 
-@requires_gpu
-def test_focal_min_multiband_warns_gpu(multiband_raster):
-    """raster_focal_min GPU path warns on multiband input."""
+def test_focal_min_multiband():
+    """raster_focal_min processes all 3 bands via per-band CPU dispatch."""
     from vibespatial.raster.algebra import raster_focal_min
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_focal_min(multiband_raster, radius=1, use_gpu=True)
+    rng = np.random.default_rng(42)
+    data = rng.random((3, 6, 6), dtype=np.float64)
+    raster = from_numpy(data, affine=_AFFINE)
+
+    result = raster_focal_min(raster, radius=1, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 6, 6), f"Expected (3, 6, 6), got {out.shape}"
+
+    # Verify each band matches single-band result
+    for i in range(3):
+        band_raster = from_numpy(data[i], affine=_AFFINE)
+        band_result = raster_focal_min(band_raster, radius=1, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband focal_min",
+        )
+
+    assert result.affine == raster.affine
+    assert result.crs == raster.crs
 
 
-def test_focal_min_multiband_warns_cpu(multiband_raster):
-    """raster_focal_min CPU path warns on multiband input."""
-    from vibespatial.raster.algebra import raster_focal_min
+def test_focal_mean_multiband_cpu():
+    """raster_focal_mean processes all 3 bands via per-band CPU dispatch."""
+    from vibespatial.raster.algebra import raster_focal_mean
 
-    with pytest.warns(UserWarning, match=r"Multiband raster with 3 bands"):
-        raster_focal_min(multiband_raster, radius=1, use_gpu=False)
+    rng = np.random.default_rng(42)
+    data = rng.random((3, 6, 6), dtype=np.float64)
+    raster = from_numpy(data, affine=_AFFINE)
+
+    result = raster_focal_mean(raster, radius=1, use_gpu=False)
+    out = result.to_numpy()
+    assert out.shape == (3, 6, 6), f"Expected (3, 6, 6), got {out.shape}"
+
+    for i in range(3):
+        band_raster = from_numpy(data[i], affine=_AFFINE)
+        band_result = raster_focal_mean(band_raster, radius=1, use_gpu=False)
+        np.testing.assert_allclose(
+            out[i],
+            band_result.to_numpy(),
+            atol=1e-12,
+            err_msg=f"Band {i} mismatch in multiband focal_mean",
+        )
 
 
 # ---------------------------------------------------------------------------
-# Label: morphology CPU
+# Label: morphology CPU (unchanged -- still uses squeeze+warn)
 # ---------------------------------------------------------------------------
 
 
@@ -211,7 +319,7 @@ def test_morphology_cpu_multiband_warns(multiband_binary_raster):
 
 
 # ---------------------------------------------------------------------------
-# Verify warning message content
+# Verify warning message content (expression path only)
 # ---------------------------------------------------------------------------
 
 
