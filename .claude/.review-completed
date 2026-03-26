@@ -1,6 +1,6 @@
 {
-  "timestamp": "2026-03-26T19:16:45Z",
-  "staged_hash": "1bd66c2ea7b15672609bf04b63fc7c360c9f93a8138229711932544c613b27a5",
-  "files": [".claude/.review-completed","src/vibespatial/raster/distance.py","src/vibespatial/raster/histogram.py","src/vibespatial/raster/hydrology.py","tests/test_raster_distance.py","tests/test_raster_histogram.py","tests/test_raster_hydrology.py"],
+  "timestamp": "2026-03-26T19:49:20Z",
+  "staged_hash": "9982eb2c788f854162151ea1136b01a8d53df2adaac206271c0659c69e533949",
+  "files": [".claude/.review-completed","src/vibespatial/raster/algebra.py","tests/test_raster_band_expression.py"],
   "verdict": "LAND"
 }
