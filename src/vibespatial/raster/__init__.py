@@ -117,6 +117,10 @@ __all__ = [
     "max_bands_for_budget",
     "dispatch_per_band_gpu",
     "dispatch_per_band_cpu",
+    # Memory pool management (ADR-0040)
+    "configure_memory_pool",
+    "memory_pool_stats",
+    "free_pool_memory",
     # NVRTC cache management (from vibespatial.cuda_runtime)
     "clear_nvrtc_cache",
     "nvrtc_cache_stats",
@@ -236,6 +240,11 @@ def __getattr__(name):
         from vibespatial.raster import dispatch
 
         return getattr(dispatch, name)
+    # Memory pool management (ADR-0040)
+    if name in ("configure_memory_pool", "memory_pool_stats", "free_pool_memory"):
+        from vibespatial.raster import memory
+
+        return getattr(memory, name)
     # NVRTC cache management
     if name in ("clear_nvrtc_cache", "nvrtc_cache_stats"):
         from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats

@@ -43,9 +43,11 @@ fragmentation, and concurrent kernel launches."""
 def available_vram_bytes() -> int:
     """Return the effective available VRAM in bytes after headroom.
 
-    The effective available memory accounts for both genuinely free device
-    memory *and* blocks held by CuPy's memory pool that can be reused without
-    a new ``cudaMalloc``.  A 15 % headroom fraction is subtracted from the sum
+    When RMM is the active allocator (tiers A/B/C), the function queries
+    ``rmm.mr.available_device_memory`` which accounts for pool-managed
+    blocks.  Otherwise it falls back to the CuPy pool query.
+
+    A 15 % headroom fraction is subtracted from the effective free memory
     to leave breathing room for the CUDA driver, fragmentation, and any
     concurrent allocations.
 
@@ -58,6 +60,17 @@ def available_vram_bytes() -> int:
         return 0
 
     try:
+        # Check if RMM is managing the pool (tiers A/B/C).
+        from vibespatial.raster.memory import _active_tier, _configured
+
+        if _configured and _active_tier in ("A", "B", "C"):
+            import rmm.mr
+
+            free, _total = rmm.mr.available_device_memory()
+            usable = int(free * (1.0 - _VRAM_HEADROOM_FRACTION))
+            return max(0, usable)
+
+        # Fallback: CuPy pool query (original logic).
         free, _ = cp.cuda.runtime.memGetInfo()
         pool_free = cp.get_default_memory_pool().free_bytes()
         effective = free + pool_free

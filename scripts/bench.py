@@ -302,6 +302,12 @@ class TestContext:
             cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:
             pass
+        try:
+            from vibespatial.raster.memory import free_pool_memory
+
+            free_pool_memory()
+        except Exception:
+            pass
         from vibespatial.raster import from_numpy
 
         for key, info in host_snapshots.items():
@@ -932,6 +938,12 @@ def _free_gpu_memory(ctx: TestContext | None = None):
 
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        from vibespatial.raster.memory import free_pool_memory
+
+        free_pool_memory()
     except Exception:
         pass
 
