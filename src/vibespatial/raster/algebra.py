@@ -364,7 +364,12 @@ def raster_apply(
         Force GPU (True), force CPU (False), or auto-detect (None).
     """
     if use_gpu is None:
-        use_gpu = _should_use_gpu_algebra(raster)
+        # raster_apply uses a zero threshold because the caller controls the
+        # function.  A CuPy callable (e.g. cp.sqrt) will fail on numpy arrays,
+        # so we must route to GPU whenever CUDA is available regardless of
+        # raster size.  The standard pixel-count threshold is designed for ops
+        # where *we* control both paths -- it does not apply here.
+        use_gpu = _should_use_gpu_algebra(raster, threshold=0)
 
     if use_gpu:
         return _raster_apply_gpu(raster, func, nodata=nodata)
