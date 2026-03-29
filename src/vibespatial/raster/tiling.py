@@ -12,8 +12,15 @@ enough border context for neighbourhood kernels (convolution, slope,
 hillshade, morphology, focal statistics).  The result is trimmed back to
 the effective tile region and stitched seamlessly.
 
+Phase 3 (vibeSpatial-fx3.4): accumulator tiling for reduce operations.
+Map-reduce pattern for operations that summarize a raster into non-raster
+data (histograms, percentiles, zonal statistics).  Each tile produces a
+partial accumulator which is merged pairwise via a caller-provided
+``merge_fn``.
+
 ADR: vibeSpatial-fx3.2  Phase 1: Trivial tiling for pointwise operations
 ADR: vibeSpatial-fx3.3  Phase 2: Halo tiling for stencil operations
+ADR: vibeSpatial-fx3.4  Phase 3: Accumulator tiling for histogram/zonal
 """
 
 from __future__ import annotations
@@ -29,6 +36,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "dispatch_tiled",
+    "dispatch_tiled_accumulator",
     "dispatch_tiled_binary",
     "dispatch_tiled_halo",
 ]
@@ -642,3 +650,115 @@ def dispatch_tiled_halo(
         )
     )
     return result
+
+
+def dispatch_tiled_accumulator[T](
+    raster: OwnedRasterArray,
+    tile_fn: Callable[[OwnedRasterArray], T],
+    merge_fn: Callable[[T, T], T],
+    plan: RasterPlan,
+) -> T:
+    """Execute a reduce operation over spatial tiles using map-reduce.
+
+    Unlike :func:`dispatch_tiled` which produces a raster output of the same
+    spatial dimensions, this function produces an aggregated result by:
+
+    1. Splitting the raster into non-overlapping tiles (using
+       ``plan.tile_shape``).
+    2. Applying ``tile_fn`` to each tile to get a partial accumulator.
+    3. Merging partial accumulators left-to-right using ``merge_fn``.
+
+    Parameters
+    ----------
+    raster:
+        Input raster (single- or multi-band).  Must be HOST-resident for
+        the TILED path; the WHOLE fast path accepts any residency.
+    tile_fn:
+        Maps a tile ``OwnedRasterArray`` to a partial accumulator of type T.
+        For histogram: returns ``(counts_array, bin_edges_array)``.
+        For zonal stats: returns ``{zone_id: {stat: value}}``.
+    merge_fn:
+        Combines two partial accumulators into one.  Must be associative
+        (caller's responsibility).
+        For histogram: sums counts, keeps bin_edges.
+        For zonal stats: merges per-zone sums/counts/min/max.
+    plan:
+        A frozen ``RasterPlan``.  Uses ``plan.tile_shape`` for tiling
+        dimensions.  ``plan.halo`` is ignored (accumulator ops don't
+        need overlap).
+
+    Returns
+    -------
+    T
+        The final merged accumulator.
+
+    Raises
+    ------
+    ValueError
+        If ``plan.strategy`` is ``TILED`` but ``plan.tile_shape`` is None,
+        or if the raster is DEVICE-resident on the TILED path, or if the
+        raster has degenerate (zero) spatial dimensions.
+    """
+    from vibespatial.raster.buffers import TilingStrategy, from_numpy
+
+    # -- WHOLE fast path: no tiling overhead --
+    if plan.strategy == TilingStrategy.WHOLE:
+        return tile_fn(raster)
+
+    # -- TILED path --
+    if plan.tile_shape is None:
+        raise ValueError(
+            "RasterPlan has strategy=TILED but tile_shape is None; this indicates a malformed plan"
+        )
+
+    tile_h, tile_w = plan.tile_shape
+    host = _ensure_host_resident(raster, label="dispatch_tiled_accumulator")
+    raster_h = raster.height
+    raster_w = raster.width
+
+    # Compute tile grid dimensions.
+    rows_of_tiles = (raster_h + tile_h - 1) // tile_h
+    cols_of_tiles = (raster_w + tile_w - 1) // tile_w
+
+    accumulator: T | None = None
+    tiles_processed = 0
+
+    for tr in range(rows_of_tiles):
+        for tc in range(cols_of_tiles):
+            rs, re, cs, ce = _tile_bounds(tr, tc, tile_h, tile_w, raster_h, raster_w)
+
+            # Slice tile from host array (contiguous for DMA).
+            if host.ndim == 3:
+                tile_data = np.ascontiguousarray(host[:, rs:re, cs:ce])
+            else:
+                tile_data = np.ascontiguousarray(host[rs:re, cs:ce])
+
+            # Adjust affine for this tile's spatial position.
+            tile_affine = _adjust_affine(raster.affine, row_offset=rs, col_offset=cs)
+
+            # Wrap tile as OwnedRasterArray (HOST-resident).
+            tile_raster = from_numpy(
+                tile_data,
+                nodata=raster.nodata,
+                affine=tile_affine,
+                crs=raster.crs,
+            )
+
+            # Apply tile_fn to get partial accumulator.
+            partial = tile_fn(tile_raster)
+
+            # Merge with running accumulator.
+            if accumulator is None:
+                accumulator = partial
+            else:
+                accumulator = merge_fn(accumulator, partial)
+
+            # Release tile references.
+            del tile_raster, tile_data, partial
+
+            tiles_processed += 1
+
+    if accumulator is None:
+        raise ValueError("Zero tiles processed; input raster has degenerate dimensions")
+
+    return accumulator

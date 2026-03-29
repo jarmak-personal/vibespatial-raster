@@ -1,4 +1,4 @@
-"""Tests for the Phase 1 tiling execution engine (vibeSpatial-fx3.2).
+"""Tests for the tiling execution engine (vibeSpatial-fx3.2, fx3.3, fx3.4).
 
 Covers:
 - WHOLE fast-path (op_fn called directly, no tiling overhead)
@@ -13,6 +13,7 @@ Covers:
 - Diagnostic events: RUNTIME events appended for tiled dispatches
 - Malformed plan: TILED with tile_shape=None raises ValueError
 - Binary spatial mismatch: a and b with different shapes raises ValueError
+- Phase 3 accumulator tiling: map-reduce for histogram/zonal-style ops
 
 All tests use explicit RasterPlan construction -- no GPU dependency.
 """
@@ -33,6 +34,7 @@ from vibespatial.raster.tiling import (
     _adjust_affine,
     _tile_bounds,
     dispatch_tiled,
+    dispatch_tiled_accumulator,
     dispatch_tiled_binary,
     dispatch_tiled_halo,
 )
@@ -1483,3 +1485,439 @@ class TestHaloConstantAndAllNodata:
         result = dispatch_tiled_halo(raster, lambda r: r, plan)
         assert result.nodata == -9999.0
         np.testing.assert_array_equal(result.to_numpy(), -9999.0)
+
+
+# ===========================================================================
+# Phase 3: dispatch_tiled_accumulator — accumulator tiling for reduce ops
+# (vibeSpatial-fx3.4)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — WHOLE fast path
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorWhole:
+    def test_whole_calls_tile_fn_once(self):
+        """WHOLE plan passes the raster through tile_fn directly, no merge."""
+        raster = _make_raster(32, 32, dtype=np.float32)
+        calls: list[OwnedRasterArray] = []
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            calls.append(r)
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            raise AssertionError("merge_fn should not be called on WHOLE path")
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+        assert len(calls) == 1
+        assert calls[0] is raster
+        assert isinstance(result, float)
+
+    def test_whole_returns_tile_fn_result(self):
+        raster = _make_raster(32, 32, dtype=np.float32, fill=2.0)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+        expected = 2.0 * 32 * 32
+        assert result == pytest.approx(expected)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — sum accumulator
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorSum:
+    def test_tiled_sum_matches_whole(self):
+        """tile_fn returns pixel sum, merge_fn adds. Tiled sum matches non-tiled."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result_tiled = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        result_whole = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+        assert result_tiled == pytest.approx(result_whole, rel=1e-5)
+
+    def test_tiled_sum_small_tiles(self):
+        """16x16 tiles on 64x64 raster (16 tiles)."""
+        raster = _make_raster(64, 64, dtype=np.float64, fill=1.0)
+        plan = _make_tiled_plan(16, 16)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result == pytest.approx(64 * 64)
+
+    def test_tiled_sum_tile_count(self):
+        """tile_fn is called once per tile."""
+        raster = _make_raster(64, 48)
+        plan = _make_tiled_plan(32, 32)
+        call_count = 0
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            nonlocal call_count
+            call_count += 1
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        # ceil(64/32)=2 rows, ceil(48/32)=2 cols -> 4 tiles
+        assert call_count == 4
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — min/max accumulator
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorMinMax:
+    def test_tiled_minmax_matches_whole(self):
+        """tile_fn returns (min, max), merge_fn takes overall min/max."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> tuple[float, float]:
+            data = r.to_numpy()
+            return (float(data.min()), float(data.max()))
+
+        def merge_fn(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+            return (min(a[0], b[0]), max(a[1], b[1]))
+
+        result_tiled = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        result_whole = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+        assert result_tiled[0] == pytest.approx(result_whole[0])
+        assert result_tiled[1] == pytest.approx(result_whole[1])
+
+    def test_minmax_known_values(self):
+        """Known min/max in specific positions are found correctly."""
+        data = np.ones((32, 32), dtype=np.float32) * 50.0
+        data[5, 5] = -100.0
+        data[25, 25] = 999.0
+        raster = from_numpy(data, nodata=None, affine=_TEST_AFFINE)
+        plan = _make_tiled_plan(16, 16)
+
+        def tile_fn(r: OwnedRasterArray) -> tuple[float, float]:
+            d = r.to_numpy()
+            return (float(d.min()), float(d.max()))
+
+        def merge_fn(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+            return (min(a[0], b[0]), max(a[1], b[1]))
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result[0] == pytest.approx(-100.0)
+        assert result[1] == pytest.approx(999.0)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — histogram accumulator
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorHistogram:
+    def test_tiled_histogram_matches_whole(self):
+        """tile_fn returns (counts, bin_edges) via np.histogram.
+        merge_fn sums counts. Tiled result matches non-tiled."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        bins = np.linspace(0.0, 1.0, 11)
+
+        def tile_fn(r: OwnedRasterArray) -> tuple[np.ndarray, np.ndarray]:
+            counts, edges = np.histogram(r.to_numpy(), bins=bins)
+            return (counts, edges)
+
+        def merge_fn(
+            a: tuple[np.ndarray, np.ndarray],
+            b: tuple[np.ndarray, np.ndarray],
+        ) -> tuple[np.ndarray, np.ndarray]:
+            return (a[0] + b[0], a[1])
+
+        plan = _make_tiled_plan(32, 32)
+        result_tiled = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        result_whole = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+
+        np.testing.assert_array_equal(result_tiled[0], result_whole[0])
+        np.testing.assert_array_equal(result_tiled[1], result_whole[1])
+
+    def test_histogram_total_count(self):
+        """Total counts across all bins equal the total pixel count."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        bins = np.linspace(0.0, 1.0, 11)
+
+        def tile_fn(r: OwnedRasterArray) -> tuple[np.ndarray, np.ndarray]:
+            return np.histogram(r.to_numpy(), bins=bins)
+
+        def merge_fn(
+            a: tuple[np.ndarray, np.ndarray],
+            b: tuple[np.ndarray, np.ndarray],
+        ) -> tuple[np.ndarray, np.ndarray]:
+            return (a[0] + b[0], a[1])
+
+        plan = _make_tiled_plan(16, 16)
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result[0].sum() == 64 * 64
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — dict accumulator (zonal-style)
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorDict:
+    def test_tiled_dict_matches_whole(self):
+        """tile_fn returns {zone: count}, merge_fn merges dicts (summing counts)."""
+        # Create a raster with 4 zones (quadrants 0-3)
+        data = np.zeros((32, 32), dtype=np.int32)
+        data[:16, :16] = 0
+        data[:16, 16:] = 1
+        data[16:, :16] = 2
+        data[16:, 16:] = 3
+        raster = from_numpy(data, nodata=None, affine=_TEST_AFFINE)
+
+        def tile_fn(r: OwnedRasterArray) -> dict[int, int]:
+            d = r.to_numpy()
+            unique, counts = np.unique(d, return_counts=True)
+            return {int(u): int(c) for u, c in zip(unique, counts)}
+
+        def merge_fn(a: dict[int, int], b: dict[int, int]) -> dict[int, int]:
+            merged = dict(a)
+            for k, v in b.items():
+                merged[k] = merged.get(k, 0) + v
+            return merged
+
+        plan = _make_tiled_plan(16, 16)
+        result_tiled = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        result_whole = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, _WHOLE_PLAN)
+
+        assert result_tiled == result_whole
+        # Each quadrant is 16x16 = 256 pixels
+        assert result_tiled == {0: 256, 1: 256, 2: 256, 3: 256}
+
+    def test_dict_with_overlapping_zones(self):
+        """Zones that span multiple tiles are correctly merged."""
+        # Single zone value across the entire raster
+        data = np.full((32, 32), 7, dtype=np.int32)
+        raster = from_numpy(data, nodata=None, affine=_TEST_AFFINE)
+
+        def tile_fn(r: OwnedRasterArray) -> dict[int, int]:
+            d = r.to_numpy()
+            unique, counts = np.unique(d, return_counts=True)
+            return {int(u): int(c) for u, c in zip(unique, counts)}
+
+        def merge_fn(a: dict[int, int], b: dict[int, int]) -> dict[int, int]:
+            merged = dict(a)
+            for k, v in b.items():
+                merged[k] = merged.get(k, 0) + v
+            return merged
+
+        plan = _make_tiled_plan(16, 16)
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result == {7: 32 * 32}
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — edge tiles
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorEdgeTiles:
+    def test_non_divisible_raster_sum(self):
+        """Non-divisible raster dimensions still produce correct sum."""
+        raster = _make_raster(50, 35, dtype=np.float32, fill=1.0)
+        plan = _make_tiled_plan(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result == pytest.approx(50 * 35)
+
+    def test_non_divisible_tile_count(self):
+        """50x35 with 32x32 tiles: ceil(50/32)=2, ceil(35/32)=2 -> 4 tiles."""
+        raster = _make_raster(50, 35)
+        plan = _make_tiled_plan(32, 32)
+        call_count = 0
+
+        def tile_fn(r: OwnedRasterArray) -> int:
+            nonlocal call_count
+            call_count += 1
+            return r.pixel_count
+
+        def merge_fn(a: int, b: int) -> int:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert call_count == 4
+        assert result == 50 * 35
+
+    def test_asymmetric_tiles_sum(self):
+        """Non-square raster with non-square tiles."""
+        raster = _make_raster(100, 60, dtype=np.float64, fill=0.5)
+        plan = _make_tiled_plan(40, 25)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result == pytest.approx(0.5 * 100 * 60)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — multiband
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorMultiband:
+    def test_3band_sum(self):
+        """3-band raster: tile_fn receives tiles with all bands."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32, fill=1.0)
+        plan = _make_tiled_plan(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            assert r.band_count == 3
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        # 3 bands * 64 * 64 pixels * 1.0
+        assert result == pytest.approx(3 * 64 * 64)
+
+    def test_3band_per_band_stats(self):
+        """Accumulate per-band sums via dict accumulator."""
+        data = np.zeros((3, 32, 32), dtype=np.float32)
+        data[0, :, :] = 1.0
+        data[1, :, :] = 2.0
+        data[2, :, :] = 3.0
+        raster = from_numpy(data, nodata=None, affine=_TEST_AFFINE)
+        plan = _make_tiled_plan(16, 16)
+
+        def tile_fn(r: OwnedRasterArray) -> dict[int, float]:
+            d = r.to_numpy()
+            return {b: float(d[b].sum()) for b in range(d.shape[0])}
+
+        def merge_fn(a: dict[int, float], b: dict[int, float]) -> dict[int, float]:
+            merged = dict(a)
+            for k, v in b.items():
+                merged[k] = merged.get(k, 0.0) + v
+            return merged
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result[0] == pytest.approx(1.0 * 32 * 32)
+        assert result[1] == pytest.approx(2.0 * 32 * 32)
+        assert result[2] == pytest.approx(3.0 * 32 * 32)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — single tile (raster smaller than tile)
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorSingleTile:
+    def test_raster_smaller_than_tile(self):
+        """Raster smaller than tile -> one tile, no merge."""
+        raster = _make_raster(10, 15, dtype=np.float32, fill=5.0)
+        plan = _make_tiled_plan(32, 32)
+        call_count = 0
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            nonlocal call_count
+            call_count += 1
+            assert r.height == 10
+            assert r.width == 15
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            raise AssertionError("merge_fn should not be called with a single tile")
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert call_count == 1
+        assert result == pytest.approx(5.0 * 10 * 15)
+
+    def test_single_pixel_raster(self):
+        """1x1 raster: one tile, no merge."""
+        raster = _make_raster(1, 1, dtype=np.float32, fill=42.0)
+        plan = _make_tiled_plan(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            raise AssertionError("merge_fn should not be called with a single tile")
+
+        result = dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+        assert result == pytest.approx(42.0)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_accumulator — DEVICE-resident guard
+# ---------------------------------------------------------------------------
+
+
+class TestAccumulatorDeviceGuard:
+    def test_device_resident_raises(self):
+        """DEVICE-resident input on TILED path raises ValueError."""
+        from vibespatial.residency import Residency
+
+        raster = _make_raster(32, 32)
+        raster.residency = Residency.DEVICE  # simulate device-resident
+        plan = _make_tiled_plan(16, 16)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        with pytest.raises(ValueError, match="HOST-resident"):
+            dispatch_tiled_accumulator(raster, tile_fn, merge_fn, plan)
+
+    def test_tiled_plan_without_tile_shape_raises(self):
+        """TILED strategy with tile_shape=None is a malformed plan."""
+        bad_plan = RasterPlan(
+            strategy=TilingStrategy.TILED,
+            tile_shape=None,
+            halo=0,
+            n_tiles=0,
+            estimated_vram_per_tile=0,
+        )
+        raster = _make_raster(32, 32)
+
+        def tile_fn(r: OwnedRasterArray) -> float:
+            return float(r.to_numpy().sum())
+
+        def merge_fn(a: float, b: float) -> float:
+            return a + b
+
+        with pytest.raises(ValueError, match="tile_shape is None"):
+            dispatch_tiled_accumulator(raster, tile_fn, merge_fn, bad_plan)
+
+    def test_accumulator_importable_via_init(self):
+        """dispatch_tiled_accumulator is importable via __init__.py."""
+        from vibespatial.raster import dispatch_tiled_accumulator as dta
+
+        assert callable(dta)
