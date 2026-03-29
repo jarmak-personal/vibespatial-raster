@@ -18,9 +18,15 @@ data (histograms, percentiles, zonal statistics).  Each tile produces a
 partial accumulator which is merged pairwise via a caller-provided
 ``merge_fn``.
 
+Phase 4 (vibeSpatial-fx3.5): multi-pass tiling for CCL and distance
+transform.  Two-pass pattern for operations that require cross-tile
+communication: (1) local pass processes each tile independently,
+(2) boundary merge reconciles results across tile seams on host.
+
 ADR: vibeSpatial-fx3.2  Phase 1: Trivial tiling for pointwise operations
 ADR: vibeSpatial-fx3.3  Phase 2: Halo tiling for stencil operations
 ADR: vibeSpatial-fx3.4  Phase 3: Accumulator tiling for histogram/zonal
+ADR: vibeSpatial-fx3.5  Phase 4: Multi-pass tiling for CCL/distance
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ __all__ = [
     "dispatch_tiled_accumulator",
     "dispatch_tiled_binary",
     "dispatch_tiled_halo",
+    "dispatch_tiled_multipass",
 ]
 
 
@@ -762,3 +769,223 @@ def dispatch_tiled_accumulator[T](
         raise ValueError("Zero tiles processed; input raster has degenerate dimensions")
 
     return accumulator
+
+
+def dispatch_tiled_multipass(
+    raster: OwnedRasterArray,
+    local_fn: Callable[[OwnedRasterArray], OwnedRasterArray],
+    merge_fn: Callable[[np.ndarray, list[tuple[int, int, int, int]]], np.ndarray],
+    plan: RasterPlan,
+) -> OwnedRasterArray:
+    """Execute a multi-pass operation using spatial tiling with boundary merge.
+
+    Designed for operations that require cross-tile communication (CCL,
+    distance transform).  The executor runs two passes:
+
+    1. **Local pass**: Process each tile independently via ``local_fn``.
+       Results are assembled into a full-size intermediate array on host.
+    2. **Boundary merge**: Call ``merge_fn`` on the full intermediate array
+       with tile boundary information so that cross-tile inconsistencies
+       (disconnected labels, truncated distances) can be reconciled.
+
+    Parameters
+    ----------
+    raster:
+        Input raster (single- or multi-band).  Must be HOST-resident for
+        the TILED path; the WHOLE fast path accepts any residency.
+    local_fn:
+        Applied to each tile independently in the first pass.  Takes a
+        tile-sized ``OwnedRasterArray`` and returns a result of the same
+        spatial dimensions.  The operation may internally transfer the tile
+        to device and back -- this is the expected pattern for tiled GPU
+        processing.
+    merge_fn:
+        Applied to the full assembled intermediate result (on host) to
+        reconcile tile boundaries.  Takes:
+
+        - ``intermediate``: The assembled numpy array from all local_fn
+          results, shape ``(H, W)`` or ``(bands, H, W)``.
+        - ``tile_bounds_list``: List of ``(row_start, row_end, col_start,
+          col_end)`` tuples for each tile (row-major order), so merge_fn
+          knows where tile boundaries are.
+
+        Returns the corrected numpy array (same shape).  merge_fn runs
+        entirely on host.
+    plan:
+        A frozen ``RasterPlan`` produced by ``analyze_raster_plan()``.
+        ``plan.halo`` is used for the local pass if > 0 (same semantics
+        as ``dispatch_tiled_halo``).
+
+    Returns
+    -------
+    OwnedRasterArray
+        Result raster with the same shape, affine, CRS, and nodata as the
+        input.  The dtype is determined by ``local_fn``'s output.
+
+    Raises
+    ------
+    ValueError
+        If ``plan.strategy`` is ``TILED`` but ``plan.tile_shape`` is None,
+        or if the raster is DEVICE-resident on the TILED path.
+    """
+    from vibespatial.raster.buffers import (
+        RasterDiagnosticEvent,
+        RasterDiagnosticKind,
+        TilingStrategy,
+        from_numpy,
+    )
+    from vibespatial.residency import Residency
+
+    # -- WHOLE fast path: no tiling overhead, no merge needed --
+    if plan.strategy == TilingStrategy.WHOLE:
+        return local_fn(raster)
+
+    # -- TILED path --
+    if plan.tile_shape is None:
+        raise ValueError(
+            "RasterPlan has strategy=TILED but tile_shape is None; this indicates a malformed plan"
+        )
+
+    t0 = time.perf_counter()
+
+    tile_h, tile_w = plan.tile_shape
+    halo = plan.halo
+    host = _ensure_host_resident(raster, label="dispatch_tiled_multipass")
+    raster_h = raster.height
+    raster_w = raster.width
+
+    # Lazy output allocation: deferred until first tile result so that the
+    # output dtype matches local_fn's actual return dtype.
+    intermediate: np.ndarray | None = None
+
+    # Compute tile grid dimensions.
+    rows_of_tiles = (raster_h + tile_h - 1) // tile_h
+    cols_of_tiles = (raster_w + tile_w - 1) // tile_w
+
+    tiles_processed = 0
+    result_nodata: float | int | None = raster.nodata
+    tile_bounds_list: list[tuple[int, int, int, int]] = []
+
+    # Pass 1 (Local): Process each tile independently.
+    for tr in range(rows_of_tiles):
+        for tc in range(cols_of_tiles):
+            # Effective bounds: the output region for this tile (non-overlapping).
+            eff_rs, eff_re, eff_cs, eff_ce = _tile_bounds(
+                tr,
+                tc,
+                tile_h,
+                tile_w,
+                raster_h,
+                raster_w,
+            )
+            tile_bounds_list.append((eff_rs, eff_re, eff_cs, eff_ce))
+
+            if halo > 0:
+                # Physical bounds: expand each edge by halo, clamped to
+                # raster bounds (same as dispatch_tiled_halo).
+                phys_rs = max(0, eff_rs - halo)
+                phys_re = min(raster_h, eff_re + halo)
+                phys_cs = max(0, eff_cs - halo)
+                phys_ce = min(raster_w, eff_ce + halo)
+            else:
+                phys_rs, phys_re = eff_rs, eff_re
+                phys_cs, phys_ce = eff_cs, eff_ce
+
+            # Slice tile from host array (contiguous for DMA).
+            if host.ndim == 3:
+                tile_data = np.ascontiguousarray(host[:, phys_rs:phys_re, phys_cs:phys_ce])
+            else:
+                tile_data = np.ascontiguousarray(host[phys_rs:phys_re, phys_cs:phys_ce])
+
+            # Adjust affine to the physical tile's origin.
+            tile_affine = _adjust_affine(raster.affine, row_offset=phys_rs, col_offset=phys_cs)
+
+            tile_raster = from_numpy(
+                tile_data,
+                nodata=raster.nodata,
+                affine=tile_affine,
+                crs=raster.crs,
+            )
+
+            # Apply the local operation on the tile.
+            tile_result = local_fn(tile_raster)
+            tile_host = tile_result.to_numpy()
+
+            # Trim halo if present, extracting only the effective region.
+            if halo > 0:
+                top_trim = eff_rs - phys_rs
+                left_trim = eff_cs - phys_cs
+                eff_height = eff_re - eff_rs
+                eff_width = eff_ce - eff_cs
+
+                if tile_host.ndim == 3:
+                    interior = tile_host[
+                        :,
+                        top_trim : top_trim + eff_height,
+                        left_trim : left_trim + eff_width,
+                    ]
+                else:
+                    interior = tile_host[
+                        top_trim : top_trim + eff_height,
+                        left_trim : left_trim + eff_width,
+                    ]
+            else:
+                interior = tile_host
+
+            # Lazy allocation on first tile result.
+            if intermediate is None:
+                if host.ndim == 3:
+                    intermediate = np.empty(
+                        (host.shape[0], raster_h, raster_w),
+                        dtype=interior.dtype,
+                    )
+                else:
+                    intermediate = np.empty((raster_h, raster_w), dtype=interior.dtype)
+                result_nodata = tile_result.nodata
+
+            if intermediate.ndim == 3:
+                intermediate[:, eff_rs:eff_re, eff_cs:eff_ce] = interior
+            else:
+                intermediate[eff_rs:eff_re, eff_cs:eff_ce] = interior
+
+            # Release tile references so RMM/CuPy can reclaim memory.
+            del tile_raster, tile_result, tile_host, tile_data
+            if halo > 0:
+                del interior
+
+            tiles_processed += 1
+
+    elapsed_pass1 = time.perf_counter() - t0
+
+    # Guard against zero-tile degenerate rasters.
+    if intermediate is None:
+        raise ValueError("Zero tiles processed; input raster has degenerate dimensions")
+
+    # Pass 2 (Merge): Reconcile tile boundaries on host.
+    t1 = time.perf_counter()
+    corrected = merge_fn(intermediate, tile_bounds_list)
+    elapsed_pass2 = time.perf_counter() - t1
+
+    elapsed = time.perf_counter() - t0
+
+    result = from_numpy(
+        corrected,
+        nodata=result_nodata,
+        affine=raster.affine,
+        crs=raster.crs,
+    )
+    result.diagnostics.append(
+        RasterDiagnosticEvent(
+            kind=RasterDiagnosticKind.RUNTIME,
+            detail=(
+                f"dispatch_tiled_multipass tiles={tiles_processed} "
+                f"tile_shape=({tile_h},{tile_w}) halo={halo} "
+                f"raster_shape={raster.shape} "
+                f"pass1={elapsed_pass1:.4f}s pass2={elapsed_pass2:.4f}s "
+                f"elapsed={elapsed:.4f}s"
+            ),
+            residency=Residency.HOST,
+            elapsed_seconds=elapsed,
+        )
+    )
+    return result

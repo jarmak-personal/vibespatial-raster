@@ -1,4 +1,4 @@
-"""Tests for the tiling execution engine (vibeSpatial-fx3.2, fx3.3, fx3.4).
+"""Tests for the tiling execution engine (vibeSpatial-fx3.2 .. fx3.5).
 
 Covers:
 - WHOLE fast-path (op_fn called directly, no tiling overhead)
@@ -14,6 +14,7 @@ Covers:
 - Malformed plan: TILED with tile_shape=None raises ValueError
 - Binary spatial mismatch: a and b with different shapes raises ValueError
 - Phase 3 accumulator tiling: map-reduce for histogram/zonal-style ops
+- Phase 4 multi-pass tiling: local + boundary-merge for CCL/distance
 
 All tests use explicit RasterPlan construction -- no GPU dependency.
 """
@@ -37,6 +38,7 @@ from vibespatial.raster.tiling import (
     dispatch_tiled_accumulator,
     dispatch_tiled_binary,
     dispatch_tiled_halo,
+    dispatch_tiled_multipass,
 )
 
 # ---------------------------------------------------------------------------
@@ -1921,3 +1923,811 @@ class TestAccumulatorDeviceGuard:
         from vibespatial.raster import dispatch_tiled_accumulator as dta
 
         assert callable(dta)
+
+
+# ===========================================================================
+# Phase 4: dispatch_tiled_multipass — multi-pass tiling for CCL/distance
+# (vibeSpatial-fx3.5)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — WHOLE fast path
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassWholeFastPath:
+    def test_whole_calls_local_fn_directly(self):
+        """WHOLE plan passes the raster through local_fn, merge_fn NOT called."""
+        raster = _make_raster(64, 64)
+        local_calls: list[OwnedRasterArray] = []
+
+        def spy_local(r: OwnedRasterArray) -> OwnedRasterArray:
+            local_calls.append(r)
+            return r
+
+        def bad_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            raise AssertionError("merge_fn should not be called on WHOLE path")
+
+        result = dispatch_tiled_multipass(raster, spy_local, bad_merge, _WHOLE_PLAN)
+        assert len(local_calls) == 1
+        assert local_calls[0] is raster
+        assert result is raster
+
+    def test_whole_returns_local_fn_result(self):
+        raster = _make_raster(32, 32, dtype=np.float32)
+
+        def double_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(
+                r.to_numpy() * 2,
+                nodata=r.nodata,
+                affine=r.affine,
+                crs=r.crs,
+            )
+
+        def bad_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            raise AssertionError("merge_fn should not be called on WHOLE path")
+
+        result = dispatch_tiled_multipass(raster, double_op, bad_merge, _WHOLE_PLAN)
+        np.testing.assert_allclose(result.to_numpy(), raster.to_numpy() * 2)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — identity (local=identity, merge=identity)
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassIdentity:
+    def test_identity_local_identity_merge(self):
+        """local_fn=identity, merge_fn=identity -> exact input reconstruction."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_local(r: OwnedRasterArray) -> OwnedRasterArray:
+            return r
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, identity_local, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_identity_multiband(self):
+        """3-band raster with identity passes."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+        assert result.band_count == 3
+        assert result.shape == (3, 64, 64)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — merge_fn receives correct tile_bounds_list
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassTileBounds:
+    def test_tile_bounds_correctness_2x2(self):
+        """64x64 raster with 32x32 tiles: 4 tiles with correct bounds."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+        captured_bounds: list[list[tuple[int, int, int, int]]] = []
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            captured_bounds.append(tile_bounds)
+            return intermediate
+
+        dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+
+        assert len(captured_bounds) == 1
+        bounds = captured_bounds[0]
+        assert len(bounds) == 4  # 2x2 grid
+
+        # Row-major order
+        assert bounds[0] == (0, 32, 0, 32)  # top-left
+        assert bounds[1] == (0, 32, 32, 64)  # top-right
+        assert bounds[2] == (32, 64, 0, 32)  # bottom-left
+        assert bounds[3] == (32, 64, 32, 64)  # bottom-right
+
+    def test_tile_bounds_cover_full_raster(self):
+        """Tile bounds collectively cover every pixel exactly once."""
+        raster = _make_raster(50, 35, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+        captured_bounds: list[list[tuple[int, int, int, int]]] = []
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            captured_bounds.append(tile_bounds)
+            return intermediate
+
+        dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+
+        bounds = captured_bounds[0]
+        # Verify total area equals raster area
+        total_pixels = sum((re - rs) * (ce - cs) for rs, re, cs, ce in bounds)
+        assert total_pixels == 50 * 35
+
+        # Verify no overlap: paint a coverage map
+        coverage = np.zeros((50, 35), dtype=np.int32)
+        for rs, re, cs, ce in bounds:
+            coverage[rs:re, cs:ce] += 1
+        np.testing.assert_array_equal(coverage, 1)
+
+    def test_tile_bounds_count_non_divisible(self):
+        """Non-divisible dims: correct number of tiles and edge bounds."""
+        raster = _make_raster(50, 35, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+        captured_bounds: list[list[tuple[int, int, int, int]]] = []
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            captured_bounds.append(tile_bounds)
+            return intermediate
+
+        dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+
+        bounds = captured_bounds[0]
+        # ceil(50/32)=2 rows, ceil(35/32)=2 cols -> 4 tiles
+        assert len(bounds) == 4
+
+        # Edge tile sizes
+        assert bounds[0] == (0, 32, 0, 32)
+        assert bounds[1] == (0, 32, 32, 35)  # right edge: 3 cols
+        assert bounds[2] == (32, 50, 0, 32)  # bottom edge: 18 rows
+        assert bounds[3] == (32, 50, 32, 35)  # bottom-right corner
+
+    def test_tile_bounds_row_major_order(self):
+        """Bounds are emitted in row-major order (left-to-right, top-to-bottom)."""
+        raster = _make_raster(96, 96, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+        captured_bounds: list[list[tuple[int, int, int, int]]] = []
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            captured_bounds.append(tile_bounds)
+            return intermediate
+
+        dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+
+        bounds = captured_bounds[0]
+        assert len(bounds) == 9  # 3x3 grid
+
+        # Verify row-major: row_start is non-decreasing
+        for i in range(len(bounds) - 1):
+            assert bounds[i][0] <= bounds[i + 1][0]
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — merge_fn with actual merge logic
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassWithMerge:
+    def test_local_sets_tile_index_merge_renumbers(self):
+        """local_fn labels each tile with its tile index; merge_fn verifies
+        tile boundaries and renumbers tiles to sequential labels."""
+        raster = _make_raster(64, 64, dtype=np.int32, fill=0)
+        plan = _make_tiled_plan(32, 32)
+        tile_counter = [0]
+
+        def label_tile(r: OwnedRasterArray) -> OwnedRasterArray:
+            idx = tile_counter[0]
+            tile_counter[0] += 1
+            data = np.full_like(r.to_numpy(), idx)
+            return from_numpy(data, nodata=r.nodata, affine=r.affine, crs=r.crs)
+
+        def renumber_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            # Renumber each tile to value = tile_index * 10
+            result = intermediate.copy()
+            for i, (rs, re, cs, ce) in enumerate(tile_bounds):
+                result[rs:re, cs:ce] = i * 10
+            return result
+
+        result = dispatch_tiled_multipass(raster, label_tile, renumber_merge, plan)
+        rd = result.to_numpy()
+
+        # Verify the merge renumbered correctly
+        assert rd[0, 0] == 0  # tile 0 -> 0
+        assert rd[0, 32] == 10  # tile 1 -> 10
+        assert rd[32, 0] == 20  # tile 2 -> 20
+        assert rd[32, 32] == 30  # tile 3 -> 30
+
+    def test_merge_stitches_boundary_labels(self):
+        """Simulate CCL-like boundary merge: adjacent tiles with same value
+        at boundary get unified labels after merge."""
+        # 64x64 raster filled with 1s (all one component)
+        raster = _make_raster(64, 64, dtype=np.int32, fill=1)
+        plan = _make_tiled_plan(32, 32)
+        tile_counter = [0]
+
+        def local_label(r: OwnedRasterArray) -> OwnedRasterArray:
+            """Each tile gets a different label (simulating local CCL)."""
+            idx = tile_counter[0]
+            tile_counter[0] += 1
+            data = np.full_like(r.to_numpy(), idx + 1)
+            return from_numpy(data, nodata=r.nodata, affine=r.affine, crs=r.crs)
+
+        def boundary_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            """Merge: find min label across all boundary-adjacent tiles,
+            relabel everything to that min (simple union-find simulation)."""
+            # Find all unique labels at tile boundaries
+            labels = set()
+            for rs, re, cs, ce in tile_bounds:
+                # Check horizontal boundary (bottom edge of this tile)
+                if re < intermediate.shape[-2]:
+                    labels.update(intermediate[re - 1, cs:ce].tolist())
+                    labels.update(intermediate[re, cs:ce].tolist())
+                # Check vertical boundary (right edge)
+                if ce < intermediate.shape[-1]:
+                    labels.update(intermediate[rs:re, ce - 1].tolist())
+                    labels.update(intermediate[rs:re, ce].tolist())
+
+            # All tiles connected -> relabel everything to min label
+            if len(labels) > 0:
+                min_label = min(labels)
+                result = np.full_like(intermediate, min_label)
+                return result
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, local_label, boundary_merge, plan)
+        rd = result.to_numpy()
+
+        # After merge, entire raster should have uniform label
+        assert np.all(rd == rd[0, 0])
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — halo support
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassHalo:
+    def test_halo_identity_reconstruction(self):
+        """With halo > 0, identity local_fn + identity merge reconstructs input."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_halo_tiles_receive_expanded_data(self):
+        """With halo, local_fn receives physically larger tiles."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        halo = 3
+        plan = _make_halo_plan(32, 32, halo=halo)
+        physical_shapes: list[tuple[int, ...]] = []
+
+        def shape_spy(r: OwnedRasterArray) -> OwnedRasterArray:
+            physical_shapes.append(r.shape)
+            return r
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        dispatch_tiled_multipass(raster, shape_spy, identity_merge, plan)
+
+        # 2x2 tile grid -> 4 tiles
+        assert len(physical_shapes) == 4
+
+        # Each physical tile should be larger than the effective 32x32
+        for shape in physical_shapes:
+            assert shape[0] > 32 or shape[1] > 32
+
+    def test_halo_edge_tiles_clamped(self):
+        """At raster boundary, halo expansion is clamped."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        halo = 5
+        plan = _make_halo_plan(32, 32, halo=halo)
+        physical_shapes: list[tuple[int, ...]] = []
+
+        def shape_spy(r: OwnedRasterArray) -> OwnedRasterArray:
+            physical_shapes.append(r.shape)
+            return r
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        dispatch_tiled_multipass(raster, shape_spy, identity_merge, plan)
+
+        # Tile (0,0): top/left halo = 0, bottom/right halo = 5 -> (37, 37)
+        assert physical_shapes[0] == (32 + halo, 32 + halo)
+        # Tile (1,1): top/left halo = 5, bottom/right = 0 -> (37, 37)
+        assert physical_shapes[3] == (32 + halo, 32 + halo)
+
+    def test_halo_zero_matches_no_halo(self):
+        """halo=0 multipass produces same result as halo-free plan."""
+        raster = _make_raster(64, 64, dtype=np.float32)
+        plan_halo0 = _make_halo_plan(32, 32, halo=0)
+        plan_plain = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result_halo = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan_halo0)
+        result_plain = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan_plain)
+        np.testing.assert_array_equal(result_halo.to_numpy(), result_plain.to_numpy())
+
+    def test_halo_non_divisible_reconstruction(self):
+        """Non-divisible raster with halo reconstructs correctly."""
+        raster = _make_raster(50, 35, dtype=np.float32)
+        plan = _make_halo_plan(32, 32, halo=2)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — multiband
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassMultiband:
+    def test_3band_identity(self):
+        """3-band raster multi-pass identity."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+        assert result.band_count == 3
+        assert result.shape == (3, 64, 64)
+
+    def test_3band_double_with_merge(self):
+        """3-band raster: local_fn doubles, merge_fn is identity."""
+        raster = _make_raster(64, 64, bands=3, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def double_op(r: OwnedRasterArray) -> OwnedRasterArray:
+            return from_numpy(
+                r.to_numpy() * 2,
+                nodata=r.nodata,
+                affine=r.affine,
+                crs=r.crs,
+            )
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, double_op, identity_merge, plan)
+        expected = raster.to_numpy() * 2
+        np.testing.assert_allclose(result.to_numpy(), expected)
+        assert result.band_count == 3
+
+    def test_multiband_edge_tiles(self):
+        """3-band raster with non-divisible dims."""
+        raster = _make_raster(50, 35, bands=3, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+        assert result.shape == (3, 50, 35)
+
+    def test_multiband_tiles_receive_all_bands(self):
+        """Each tile in multipass receives all bands."""
+        raster = _make_raster(32, 32, bands=4, dtype=np.uint8)
+        plan = _make_tiled_plan(16, 16)
+
+        def check_bands(r: OwnedRasterArray) -> OwnedRasterArray:
+            assert r.band_count == 4
+            assert r.to_numpy().ndim == 3
+            assert r.to_numpy().shape[0] == 4
+            return r
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        dispatch_tiled_multipass(raster, check_bands, identity_merge, plan)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — edge tiles
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassEdgeTiles:
+    def test_non_divisible_raster(self):
+        """50x50 raster with 32x32 tiles: result matches input."""
+        raster = _make_raster(50, 50, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_raster_smaller_than_tile(self):
+        """Raster smaller than tile -> one tile, merge still called."""
+        raster = _make_raster(10, 15, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+        local_count = [0]
+        merge_count = [0]
+
+        def counting_local(r: OwnedRasterArray) -> OwnedRasterArray:
+            local_count[0] += 1
+            assert r.height == 10
+            assert r.width == 15
+            return r
+
+        def counting_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            merge_count[0] += 1
+            assert len(tile_bounds) == 1
+            assert tile_bounds[0] == (0, 10, 0, 15)
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, counting_local, counting_merge, plan)
+        assert local_count[0] == 1
+        assert merge_count[0] == 1
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_asymmetric_tile_and_raster(self):
+        """Non-square raster with non-square tiles."""
+        raster = _make_raster(100, 60, dtype=np.int16)
+        plan = _make_tiled_plan(40, 25)  # 3 row tiles, 3 col tiles
+        call_count = [0]
+
+        def counting_local(r: OwnedRasterArray) -> OwnedRasterArray:
+            call_count[0] += 1
+            return r
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, counting_local, identity_merge, plan)
+        # ceil(100/40)=3, ceil(60/25)=3 -> 9 tiles
+        assert call_count[0] == 9
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_single_pixel_raster(self):
+        """1x1 raster with tiling still works."""
+        raster = _make_raster(1, 1, dtype=np.float32, fill=42.0)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            assert len(tile_bounds) == 1
+            assert tile_bounds[0] == (0, 1, 0, 1)
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.to_numpy().item() == pytest.approx(42.0)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — metadata preservation
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassMetadataPreservation:
+    def test_affine_preserved(self):
+        custom_affine = (5.0, 0.0, 100.0, 0.0, -5.0, 200.0)
+        raster = _make_raster(32, 32, affine=custom_affine)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.affine == custom_affine
+
+    def test_nodata_preserved(self):
+        raster = _make_raster(32, 32, nodata=-9999.0)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.nodata == -9999.0
+
+    def test_crs_preserved(self):
+        raster = _make_raster(32, 32)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.crs == raster.crs
+
+    @pytest.mark.parametrize("dtype", [np.uint8, np.int16, np.int32, np.float32, np.float64])
+    def test_dtype_roundtrip(self, dtype):
+        raster = _make_raster(32, 32, dtype=dtype)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.dtype == np.dtype(dtype)
+        np.testing.assert_array_equal(result.to_numpy(), raster.to_numpy())
+
+    def test_nodata_positions_preserved(self):
+        """Nodata sentinel values at known positions survive multipass tiling."""
+        data = _RNG.random((64, 64)).astype(np.float32)
+        data[0, 0] = -9999.0
+        data[31, 31] = -9999.0
+        data[63, 63] = -9999.0
+        raster = from_numpy(data, nodata=-9999.0, affine=_TEST_AFFINE)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        rd = result.to_numpy()
+        assert rd[0, 0] == -9999.0
+        assert rd[31, 31] == -9999.0
+        assert rd[63, 63] == -9999.0
+        assert result.nodata == -9999.0
+
+    def test_nan_nodata_preserved(self):
+        """NaN nodata in float rasters is preserved through multipass tiling."""
+        data = _RNG.random((32, 32)).astype(np.float32)
+        data[5, 5] = np.nan
+        data[20, 20] = np.nan
+        raster = from_numpy(data, nodata=float("nan"), affine=_TEST_AFFINE)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.nodata is not None and np.isnan(result.nodata)
+        assert np.isnan(result.to_numpy()[5, 5])
+        assert np.isnan(result.to_numpy()[20, 20])
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassDiagnostics:
+    def test_tiled_multipass_has_runtime_event(self):
+        raster = _make_raster(64, 64)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        runtime_events = [
+            ev for ev in result.diagnostics if ev.kind == RasterDiagnosticKind.RUNTIME
+        ]
+        assert len(runtime_events) >= 1
+        evt = runtime_events[-1]
+        assert "dispatch_tiled_multipass" in evt.detail
+        assert "tiles=" in evt.detail
+        assert "pass1=" in evt.detail
+        assert "pass2=" in evt.detail
+
+    def test_diagnostic_includes_halo_value(self):
+        """The diagnostic detail string contains the actual halo value."""
+        raster = _make_raster(32, 32)
+        plan = _make_halo_plan(16, 16, halo=4)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        runtime_events = [
+            ev for ev in result.diagnostics if ev.kind == RasterDiagnosticKind.RUNTIME
+        ]
+        assert any("halo=4" in ev.detail for ev in runtime_events)
+
+    def test_whole_path_no_tiling_diagnostic(self):
+        """WHOLE path delegates to local_fn -- no tiling diagnostic appended."""
+        raster = _make_raster(32, 32)
+
+        def bad_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            raise AssertionError("merge_fn should not be called on WHOLE path")
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, bad_merge, _WHOLE_PLAN)
+        tiling_events = [
+            ev
+            for ev in result.diagnostics
+            if ev.kind == RasterDiagnosticKind.RUNTIME and "dispatch_tiled_multipass" in ev.detail
+        ]
+        assert len(tiling_events) == 0
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — error handling
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassErrorHandling:
+    def test_tiled_plan_without_tile_shape_raises(self):
+        """TILED strategy with tile_shape=None is a malformed plan."""
+        bad_plan = RasterPlan(
+            strategy=TilingStrategy.TILED,
+            tile_shape=None,
+            halo=0,
+            n_tiles=0,
+            estimated_vram_per_tile=0,
+        )
+        raster = _make_raster(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        with pytest.raises(ValueError, match="tile_shape is None"):
+            dispatch_tiled_multipass(raster, lambda r: r, identity_merge, bad_plan)
+
+    def test_device_resident_raises(self):
+        """DEVICE-resident input on TILED path raises ValueError."""
+        from vibespatial.residency import Residency
+
+        raster = _make_raster(32, 32)
+        raster.residency = Residency.DEVICE
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        with pytest.raises(ValueError, match="HOST-resident"):
+            dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — constant-value and all-nodata edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassConstantAndAllNodata:
+    def test_constant_value_raster(self):
+        raster = _make_raster(64, 64, fill=42.0, dtype=np.float32)
+        plan = _make_tiled_plan(32, 32)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        np.testing.assert_array_equal(result.to_numpy(), 42.0)
+
+    def test_all_nodata_raster(self):
+        data = np.full((32, 32), -9999.0, dtype=np.float32)
+        raster = from_numpy(data, nodata=-9999.0, affine=_TEST_AFFINE)
+        plan = _make_tiled_plan(16, 16)
+
+        def identity_merge(
+            intermediate: np.ndarray,
+            tile_bounds: list[tuple[int, int, int, int]],
+        ) -> np.ndarray:
+            return intermediate
+
+        result = dispatch_tiled_multipass(raster, lambda r: r, identity_merge, plan)
+        assert result.nodata == -9999.0
+        np.testing.assert_array_equal(result.to_numpy(), -9999.0)
+
+
+# ---------------------------------------------------------------------------
+# dispatch_tiled_multipass — lazy import via __init__.py
+# ---------------------------------------------------------------------------
+
+
+class TestMultipassLazyImport:
+    def test_dispatch_tiled_multipass_importable(self):
+        """dispatch_tiled_multipass is importable via __init__.py."""
+        from vibespatial.raster import dispatch_tiled_multipass as dtm
+
+        assert callable(dtm)
