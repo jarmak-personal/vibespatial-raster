@@ -578,6 +578,7 @@ def get_kernel_source(dtype_name: str) -> str:
 **Rules:**
 - Use `{{` and `}}` for literal braces in CUDA code (Python `.format()` escaping).
 - Map numpy dtypes to C type names: `float32 -> "float"`, `float64 -> "double"`.
+- **Integer input promotion:** Narrow integers (uint8, int16, itemsize < 4) are promoted to float32 (`"float"` kernel). Wide integers (int32, int64, itemsize >= 4) are promoted to float64 (`"double"` kernel) to preserve precision beyond 2^24. See the dtype dispatch in `_binary_op_gpu` and `_raster_expression_gpu` in `algebra.py`.
 - For float32, use `f`-suffixed constants (`3.14f`) and math functions
   (`sqrtf`, `fabsf`) to avoid implicit double promotion.
 

@@ -570,3 +570,101 @@ class TestClassifyCpuFallback:
         result = raster_classify(raster, bins=[1.0, 2.0, 3.0], labels=[0, 1, 2, 3], use_gpu=False)
         out = result.to_numpy()
         assert np.all(out == -9999.0)
+
+
+# ---------------------------------------------------------------------------
+# Integer dtype binary operations — CPU path
+# ---------------------------------------------------------------------------
+
+
+class TestIntegerDtypeCpuFallback:
+    """Verify binary algebra ops with integer-typed rasters on CPU path.
+
+    The compute-dtype dispatch promotes:
+      - wide integers (int32/int64, itemsize >= 4) -> float64
+      - narrow integers (uint8/int16, itemsize < 4)  -> float32
+    These tests exercise that logic via use_gpu=False.
+    """
+
+    def test_uint8_add(self):
+        """Two uint8 rasters: addition should produce correct results."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[10, 20], [30, 40]], dtype=np.uint8),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[1, 2], [3, 4]], dtype=np.uint8),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_add(a, b, use_gpu=False)
+        expected = np.array([[11, 22], [33, 44]])
+        np.testing.assert_array_equal(result.to_numpy(), expected)
+
+    def test_int16_subtract_nodata(self):
+        """Two int16 rasters with nodata=-9999: subtraction and nodata propagation."""
+        from vibespatial.raster.algebra import raster_subtract
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[100, -9999], [300, 400]], dtype=np.int16),
+            nodata=-9999,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[10, 20], [-9999, 40]], dtype=np.int16),
+            nodata=-9999,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_subtract(a, b, use_gpu=False)
+        data = result.to_numpy()
+        # [0,0]: 100 - 10 = 90
+        np.testing.assert_almost_equal(data[0, 0], 90)
+        # [0,1]: a is nodata -> propagate
+        assert data[0, 1] == -9999
+        # [1,0]: b is nodata -> propagate
+        assert data[1, 0] == -9999
+        # [1,1]: 400 - 40 = 360
+        np.testing.assert_almost_equal(data[1, 1], 360)
+
+    def test_int32_multiply_precision(self):
+        """Two int32 rasters with values > 2**24: float64 promotion preserves precision."""
+        from vibespatial.raster.algebra import raster_multiply
+        from vibespatial.raster.buffers import from_numpy
+
+        # 20_000_000 * 3 = 60_000_000.  In float32, 20_000_000 is exact
+        # but the product 60_000_001 would lose precision.  Using a value
+        # that distinguishes float32 vs float64: 20_000_003 * 3 = 60_000_009.
+        # float32 can only represent integers exactly up to 2**24 = 16_777_216,
+        # so 60_000_009 would be rounded in float32 but exact in float64.
+        a = from_numpy(
+            np.array([[20_000_003]], dtype=np.int32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        b = from_numpy(
+            np.array([[3]], dtype=np.int32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        result = raster_multiply(a, b, use_gpu=False)
+        data = result.to_numpy()
+        # int32 promotion -> float64 means exact integer arithmetic is preserved
+        assert data[0, 0] == 60_000_009
+
+    def test_mixed_int_float_add(self):
+        """One int16 raster + one float32 raster: addition should work."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[10, 20], [30, 40]], dtype=np.int16),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[0.5, 1.5], [2.5, 3.5]], dtype=np.float32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_add(a, b, use_gpu=False)
+        expected = np.array([[10.5, 21.5], [32.5, 43.5]])
+        np.testing.assert_array_almost_equal(result.to_numpy(), expected)

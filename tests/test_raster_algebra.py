@@ -484,3 +484,99 @@ class TestAspect:
         # Interior pixels should face roughly east (90 degrees)
         center = aspect[5, 5]
         assert 45 < center < 135, f"Expected ~90, got {center}"
+
+
+# ---------------------------------------------------------------------------
+# Integer dtype binary operations
+# ---------------------------------------------------------------------------
+
+
+class TestIntegerDtypeOps:
+    """Verify compute-dtype dispatch for integer-typed rasters.
+
+    Wide integers (int32/int64, itemsize >= 4) compute in float64.
+    Narrow integers (uint8/int16, itemsize < 4) compute in float32.
+    """
+
+    def test_uint8_add(self):
+        """uint8 + uint8: narrow integers compute in float32."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[10, 20], [30, 40]], dtype=np.uint8),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[1, 2], [3, 4]], dtype=np.uint8),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_add(a, b)
+        expected = np.array([[11, 22], [33, 44]], dtype=np.float32)
+        np.testing.assert_array_almost_equal(result.to_numpy(), expected)
+
+    def test_int16_subtract_nodata(self):
+        """int16 - int16 with nodata sentinel: verify nodata propagation."""
+        from vibespatial.raster.algebra import raster_subtract
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[100, -9999], [300, 400]], dtype=np.int16),
+            nodata=-9999,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[10, 20], [-9999, 40]], dtype=np.int16),
+            nodata=-9999,
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_subtract(a, b)
+        data = result.to_numpy()
+        # [0,0]: valid - valid = valid
+        np.testing.assert_almost_equal(data[0, 0], 90.0)
+        # [0,1]: nodata - valid = nodata
+        assert data[0, 1] == -9999.0
+        # [1,0]: valid - nodata = nodata
+        assert data[1, 0] == -9999.0
+        # [1,1]: valid - valid = valid
+        np.testing.assert_almost_equal(data[1, 1], 360.0)
+
+    def test_int32_multiply_precision(self):
+        """int32 * int32 with values > 2^24: must promote to float64.
+
+        float32 has only 24 bits of mantissa, so 20_000_000 * 3 would
+        lose precision in float32. The wide-integer path computes in
+        float64 (53-bit mantissa), preserving the exact result.
+        """
+        from vibespatial.raster.algebra import raster_multiply
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[20_000_000, 20_000_001]], dtype=np.int32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        b = from_numpy(
+            np.array([[3, 7]], dtype=np.int32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 1.0),
+        )
+        result = raster_multiply(a, b)
+        data = result.to_numpy()
+        # Exact results: 60_000_000 and 140_000_007
+        np.testing.assert_array_equal(data.ravel(), [60_000_000.0, 140_000_007.0])
+
+    def test_mixed_int_float_add(self):
+        """int16 + float32: mixed-dtype binary op should succeed."""
+        from vibespatial.raster.algebra import raster_add
+        from vibespatial.raster.buffers import from_numpy
+
+        a = from_numpy(
+            np.array([[10, 20], [30, 40]], dtype=np.int16),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        b = from_numpy(
+            np.array([[0.5, 1.5], [2.5, 3.5]], dtype=np.float32),
+            affine=(1.0, 0.0, 0.0, 0.0, -1.0, 2.0),
+        )
+        result = raster_add(a, b)
+        expected = np.array([[10.5, 21.5], [32.5, 43.5]], dtype=np.float32)
+        np.testing.assert_array_almost_equal(result.to_numpy(), expected)

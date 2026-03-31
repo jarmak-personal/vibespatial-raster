@@ -213,5 +213,6 @@ For detailed kernel patterns (shared-memory tiling, stencil ops, CCL union-find,
 - **Don't transfer data to host mid-pipeline** — the zero-copy linter will catch this (ZCOPY001-003).
 - **Don't import CuPy at module level** — use lazy imports or guard with try/except.
 - **Don't forget to update `__init__.py`** when adding new public functions.
+- **Integer-to-float compute-dtype promotion:** Wide integers (int32/int64, itemsize >= 4) are promoted to float64 for GPU and CPU compute to preserve precision. Narrow integers (uint8/int16) and float32 use the float32 fast path. Only float64 inputs produce double-precision kernels. See the dtype dispatch in `_binary_op_gpu` and `_raster_expression_gpu`.
 - **Kernel sources are Python strings**, not `.cu` files — don't create standalone CUDA files.
 - **Tests without GPU must still pass** — use `pytest.mark.gpu` skip decorators, not hard failures.
